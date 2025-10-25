@@ -2,7 +2,7 @@
   "jobs": [
     {
       "name": "one",
-      "job": "queue/jenkinsfile",
+      "job": "queue/Jenkinsfile",
       "parameters": [
         { "name": "PARAM1", "value": "alpha" },
         { "name": "PARAM2", "value": "beta" },
@@ -12,7 +12,7 @@
     },
     {
       "name": "two",
-      "job": "queue/jenkinsfile",
+      "job": "queue/Jenkinsfile",
       "parameters": [
         { "name": "PARAM1", "value": "x" },
         { "name": "PARAM2", "value": "y" },
