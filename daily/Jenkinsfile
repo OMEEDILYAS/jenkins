@@ -7,9 +7,6 @@ pipeline {
     parameters {
         choice(choices: ['one', 'two'], description: 'Select an option', name: 'OPTION')
     }
-    options {
-        buildDiscarder(numToKeepStr: '10')
-    }
     environment {
         BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId ?: 'SYSTEM'}"
     }
