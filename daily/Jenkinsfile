@@ -60,7 +60,7 @@ pipeline {
                                         echo "Triggering job '${selectedJob.job}' with parameters: ${jenkinsParams}"
 
                                         try {
-                                            build wait: true, job: queue/Jenkinsfile, parameters: jenkinsParams
+                                            build wait: true, job: 'queue/Jenkinsfile', parameters: jenkinsParams
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
