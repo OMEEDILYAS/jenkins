@@ -7,6 +7,9 @@ pipeline {
     parameters {
         choice(choices: ['one', 'two'], description: 'Select an option', name: 'OPTION')
     }
+    options {
+        buildDiscarder(daysToKeepStr: '7', numToKeepStr: '10')
+    }
     environment {
         BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId ?: 'SYSTEM'}"
     }
@@ -38,61 +41,44 @@ pipeline {
                         try {
                             def json = new groovy.json.JsonSlurper().parseText(jsonContent)
                             echo "Parsed JSON: ${json}"
-
                             try {
                                 if (!json.jobs || json.jobs.isEmpty()) {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
-
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
-
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        try {
-                                            def buildParams = params_helper(selectedJob.job)
-                                            def PARAM1 = buildParams['PARAM1']
-                                            def PARAM2 = buildParams['PARAM2']
-                                            def PARAM3 = buildParams['PARAM3']
-                                            def PARAM4 = buildParams['PARAM4']
-                                            echo "Triggering job '${selectedJob.job}' with parameters: PARAM1=${PARAM1}, PARAM2=${PARAM2}, PARAM3=${PARAM3}, PARAM4=${PARAM4}"
-                                        } catch (Exception e) {
-                                            error "Error building params: ${e.getMessage()}"
+                                        // Build Jenkins parameters from JSON (no helper needed)
+                                        def jenkinsParams = (selectedJob.parameters ?: []).collect { p ->
+                                            string(name: (p.name as String), value: (p.value == null ? '' : p.value.toString()))
                                         }
 
+                                        echo "Triggering job '${selectedJob.job}' with parameters: ${jenkinsParams}"
+
                                         try {
-                                            build wait: true, job: selectedJob.job, parameters: [
-                                                string(name: 'PARAM1', value: PARAM1),
-                                                string(name: 'PARAM2', value: PARAM2),
-                                                string(name: 'PARAM3', value: PARAM3),
-                                                string(name: 'PARAM4', value: PARAM4)
-                                            ]
+                                            build wait: true, job: selectedJob.job, parameters: jenkinsParams
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
-
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
-
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
-
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
-
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
-
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
@@ -102,12 +88,5 @@ pipeline {
     }
 }
 
-def params_helper(String jobName) {
-    def buildParams = [:]
-
-    buildParams['PARAM1'] = jobName.parameters.find { it.name == 'PARAM1' }?.value?.toString() ?: ''
-    buildParams['PARAM2'] = jobName.parameters.find { it.name == 'PARAM2' }?.value?.toString() ?: ''
-    buildParams['PARAM3'] = jobName.parameters.find { it.name == 'PARAM3' }?.value?.toString() ?: ''
-    buildParams['PARAM4'] = jobName.parameters.find { it.name == 'PARAM4' }?.value?.toString() ?: ''
-    return buildParams
-}
+// (Optional) If you later want a helper, make it accept the whole selectedJob object:
+// def params_helper(def selectedJob) { ... }
