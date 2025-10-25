@@ -4,6 +4,9 @@ pipeline{
     triggers {
         cron('* * * * *')
     }
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '7'))
+    }
     
     stages{
         stage('Daily Build'){
