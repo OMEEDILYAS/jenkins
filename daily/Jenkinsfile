@@ -1,0 +1,12 @@
+pipeline{
+    agent master
+    stages{
+        stage('Daily Build'){
+            steps{
+                script{
+                    echo "Executing Daily Build on ${env.JENKINS_URL}"
+                }
+            }
+        }
+    }
+}
