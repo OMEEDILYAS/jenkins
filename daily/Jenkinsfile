@@ -1,20 +1,103 @@
 pipeline{
     agent any
-    
     /*triggers {
-        cron('* * * * *')
+        cron '''TZ=America/Chicago
+            * * * * *'''
     }*/
-    options {
-        buildDiscarder(logRotator(numToKeepStr: '7'))
+    parameters{
+        choice( choices: ['one', 'two'], description: 'Select an option', name: 'OPTION')
     }
-    
+    options {
+        buildDiscarder(daysToKeepStr: '7', numToKeepStr: '10')
+    }
+    environment {
+        BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId ?: 'SYSTEM' }"
+    }
     stages{
-        stage('Daily Build'){
+        stage('testing'){
             steps{
                 script{
-                    echo "Executing Daily Build on ${env.JENKINS_URL}"
+                    try{
+                        echo "${BUILD_TRIGGER_BY}"
+                    }chatch (Exception e){
+                        echo "Error: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+        stage('triggered by user'){
+            when{
+                expression { BUILD_TRIGGER_BY !='SYSTEM' }
+            }
+            steps{
+                script{
+                    try{
+                        def jsonPath = 'daily/daily.json'
+                        echo "Reading JSON file at: ${jsonPath}"
+
+                        def jsonContent = readFile(jsonPath)
+                        echo "JSON Content: ${jsonContent}"
+
+                        try{
+                            def json = new groovy.json.JsonSlurper().parseText(jsonContent)
+                            echo "Parsed JSON: ${json}"
+                            try{
+                                if (!json.jobs || json.jobs.isEmpty()){
+                                    error "No jobs found in JSON."
+                                }
+                                echo "json is valid and parsed successfully."
+                                try{
+                                    echo "processing jobs: $params.OPTION"
+                                    def selectedJob = json.jobs.find{ it.name == params.OPTION }
+                                    if (!selectedJob){
+                                        error "Job '${params.OPTION}' not found in JSON."
+                                    }
+                                    try{
+                                        echo "Found job: ${selectedJob}"
+                                        try{
+                                            def buildParams = params_helper(selectedJob.job, selectedJob)
+                                            def PARAM1 = buildParams['PARAM1']
+                                            def PARAM2 = buildParams['PARAM2']
+                                            def PARAM3 = buildParams['PARAM3']
+                                            def PARAM4 = buildParams['PARAM4']
+                                            echo "Triggering job '${selectedJob.job}' with parameters: PARAM1=${PARAM1}, PARAM2=${PARAM2}, PARAM3=${PARAM3}, PARAM4=${PARAM4}"
+                                        }
+                                        try{
+                                            build wait: true job: selectedJob.job, parameters: [
+                                                string(name: 'PARAM1', value: PARAM1),
+                                                string(name: 'PARAM2', value: PARAM2),
+                                                string(name: 'PARAM3', value: PARAM3),
+                                                string(name: 'PARAM4', value: PARAM4)
+                                            ]
+                                        }catch (Exception e){
+                                            error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
+                                        }
+                                    }catch (Exception e){
+                                        error "Error processing selected job: ${e.getMessage()}"
+                                    }
+                                }chatch (Exception e){
+                                    error "Error finding selected job: ${e.getMessage()}"
+                                }
+                            }chatch (Exception e){
+                                error "Error parsing JSON content: ${e.getMessage()}"
+                            }
+                        }chatch (Exception e){
+                            error "Error reading JSON file: ${e.getMessage()}"
+                        }
+                    }chatch (Exception e){
+                        error "Unexpected error (must be the path): ${e.getMessage()}"
+                    }
                 }
             }
         }
     }
+}
+def params_helper(string jobName){
+    def buildParams = [:]
+    
+    buildParams['PARAM1'] = jobName.parameters.find{ it.name == 'PARAM1' }?.value?.toString() ?: ''
+    buildParams['PARAM2'] = jobName.parameters.find{ it.name == 'PARAM2' }?.value?.toString() ?: ''
+    buildParams['PARAM3'] = jobName.parameters.find{ it.name == 'PARAM3' }?.value?.toString() ?: ''
+    BuildParams['PARAM4'] = jobName.parameters.find{ it.name == 'PARAM4' }?.value?.toString() ?: ''
+    return buildParams
 }

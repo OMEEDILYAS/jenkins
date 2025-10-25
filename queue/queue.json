@@ -1,0 +1,24 @@
+{
+  "jobs": [
+    {
+      "name": "one",
+      "job": "queue/jenkinsfile",
+      "parameters": [
+        { "name": "PARAM1", "value": "alpha" },
+        { "name": "PARAM2", "value": "beta" },
+        { "name": "PARAM3", "value": "gamma" },
+        { "name": "PARAM4", "value": "delta" }
+      ]
+    },
+    {
+      "name": "two",
+      "job": "queue/jenkinsfile",
+      "parameters": [
+        { "name": "PARAM1", "value": "x" },
+        { "name": "PARAM2", "value": "y" },
+        { "name": "PARAM3", "value": "z" },
+        { "name": "PARAM4", "value": "v" }
+      ]
+    }
+  ]
+}

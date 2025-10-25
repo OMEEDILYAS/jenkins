@@ -1,0 +1,38 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+    }
+
+    stages {
+        stage('Read Queue') {
+            steps {
+                script {
+                    def jsonPath = 'queue/queue.json'
+                    echo "Reading queue file: ${jsonPath}"
+
+                    try {
+                        def raw = readFile(jsonPath)
+                        def parsed = new groovy.json.JsonSlurper().parseText(raw)
+
+                        if (!parsed?.jobs || !(parsed.jobs instanceof List)) {
+                            echo "Queue file has no jobs. Nothing to process."
+                            return
+                        }
+
+                        echo "✅ Found ${parsed.jobs.size()} job(s) in queue:"
+                        parsed.jobs.each { j ->
+                            echo " - name='${j.name}', job='${j.job}'"
+                        }
+
+                        echo "✅ Dry run complete. No job executions attempted."
+                    } catch (e) {
+                        echo "❌ Error reading or parsing queue: ${e.getMessage()}"
+                        error "Stopping due to error."
+                    }
+                }
+            }
+        }
+    }
+}
