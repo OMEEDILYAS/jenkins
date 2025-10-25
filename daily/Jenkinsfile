@@ -52,18 +52,39 @@ pipeline {
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // Build Jenkins parameters from JSON (no helper needed)
-                                        def jenkinsParams = (selectedJob.parameters ?: []).collect { p ->
-                                            string(name: (p.name as String), value: (p.value == null ? '' : p.value.toString()))
+                                        // ---- Minimal sh-based wash to avoid LazyMap passing into build() ----
+                                        // 1) Flatten JSON params into plain strings
+                                        def raw = [:]
+                                        (selectedJob.parameters ?: []).each { kv ->
+                                            raw[(kv.name as String)] = (kv.value == null ? '' : kv.value.toString())
                                         }
 
-                                        echo "Triggering job '${selectedJob.job}' with parameters: ${jenkinsParams}"
+                                        // 2) Round-trip through shell to guarantee clean Java Strings
+                                        def v = [:]
+                                        ['PARAM1','PARAM2','PARAM3','PARAM4'].each { k ->
+                                            def val = (raw[k] ?: '')
+                                            // escape any embedded double-quotes before sending to sh
+                                            def safe = val.replaceAll('"', '\\\\\"')
+                                            v[k] = sh(script: "printf '%s' \"${safe}\"", returnStdout: true).trim()
+                                        }
+
+                                        // 3) Build literal list of parameter step calls (no collect/closures)
+                                        def jenkinsParams = [
+                                            string(name: 'PARAM1', value: v.PARAM1 ?: ''),
+                                            string(name: 'PARAM2', value: v.PARAM2 ?: ''),
+                                            string(name: 'PARAM3', value: v.PARAM3 ?: ''),
+                                            string(name: 'PARAM4', value: v.PARAM4 ?: '')
+                                        ]
+
+                                        echo "Triggering job 'optimized/queue' with parameters: ${jenkinsParams}"
 
                                         try {
                                             build wait: true, job: 'optimized/queue', parameters: jenkinsParams
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
+                                        // --------------------------------------------------------------------
+
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
