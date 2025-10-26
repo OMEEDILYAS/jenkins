@@ -38,61 +38,40 @@ pipeline {
                         try {
                             def json = new groovy.json.JsonSlurper().parseText(jsonContent)
                             echo "Parsed JSON: ${json}"
-
                             try {
                                 if (!json.jobs || json.jobs.isEmpty()) {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
-
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
-
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // --------- Build clean String values for params ----------
+                                        // ---- Build clean databound maps (NOT steps, NOT JSON maps) ----
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
                                             raw[(kv.name as String)] = (kv.value == null ? '' : kv.value.toString())
                                         }
 
-                                        def washed = [:]
-                                        def keys = ['PARAM1','PARAM2','PARAM3','PARAM4']
+                                        // Construct exact ParameterValue databound maps
+                                        def jenkinsParams = []
+                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM1', value: (raw.PARAM1 ?: '')]
+                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM2', value: (raw.PARAM2 ?: '')]
+                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM3', value: (raw.PARAM3 ?: '')]
+                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM4', value: (raw.PARAM4 ?: '')]
+                                        // ----------------------------------------------------------------
 
-                                        if (isUnix()) {
-                                            // On Unix, round-trip through sh to ensure plain Java Strings
-                                            keys.each { k ->
-                                                def val = (raw[k] ?: '')
-                                                // escape double quotes for sh printf
-                                                def safe = val.replaceAll('"', '\\\\\"')
-                                                washed[k] = sh(script: "printf '%s' \"${safe}\"", returnStdout: true).trim()
-                                            }
-                                        } else {
-                                            // On Windows agents, values are already Strings; no sh available.
-                                            // Just assign directly (this does NOT pass any LazyMap objects).
-                                            keys.each { k ->
-                                                washed[k] = (raw[k] ?: '')
-                                            }
-                                        }
-                                        // ----------------------------------------------------------
-
-                                        // Literal list of parameter steps (avoid collect/closures)
-                                        def jenkinsParams = [
-                                            string(name: 'PARAM1', value: washed.PARAM1 ?: ''),
-                                            string(name: 'PARAM2', value: washed.PARAM2 ?: ''),
-                                            string(name: 'PARAM3', value: washed.PARAM3 ?: ''),
-                                            string(name: 'PARAM4', value: washed.PARAM4 ?: '')
-                                        ]
-
-                                        echo "Triggering job 'optimized/queue' with parameters: ${jenkinsParams}"
+                                        // IMPORTANT: use the real Jenkins job full name
+                                        def jobName = 'optimized/queue'
+                                        echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
                                         try {
-                                            build wait: true, job: 'optimized/queue', parameters: jenkinsParams
+                                            build wait: true, job: jobName, parameters: jenkinsParams
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
@@ -100,19 +79,15 @@ pipeline {
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
-
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
-
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
-
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
-
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
@@ -121,6 +96,3 @@ pipeline {
         }
     }
 }
-
-// (Optional) If you later want a helper, make it accept the whole selectedJob object:
-// def params_helper(def selectedJob) { ... }
