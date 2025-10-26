@@ -64,22 +64,23 @@ pipeline {
                                         if (isUnix()) {
                                             keys.each { k ->
                                                 def val = (raw[k] ?: '')
+                                                // escape double-quotes for sh
                                                 def safe = val.replaceAll('"', '\\\\\"')
                                                 washed[k] = sh(script: "printf '%s' \"${safe}\"", returnStdout: true).trim()
                                             }
                                         } else {
-                                            // Windows: use PowerShell here
+                                            // Windows: PowerShell here-string; escape single quotes inside value
                                             keys.each { k ->
                                                 def val = (raw[k] ?: '')
-                                                // Use here-string to preserve content verbatim
-                                                def ps = """
-$ErrorActionPreference = 'Stop'
-\$v = @'
-${val}
-'@
-[Console]::Write(\$v)
-"""
-                                                washed[k] = bat(script: "powershell -NoProfile -Command \"${ps.replace('\n','; ').replace('"','\\\"')}\"", returnStdout: true).trim()
+                                                def valEsc = val.replace("'", "''")
+                                                // IMPORTANT: use $$ to emit a literal $ in a GString
+                                                def ps = "\$${'ErrorActionPreference'}='Stop'; " +
+                                                         "\$${'v'}=@'\n${valEsc}\n'@; " +
+                                                         "[Console]::Write(\$${'v'})"
+                                                washed[k] = bat(
+                                                    script: """powershell -NoProfile -Command "${ps}"""",
+                                                    returnStdout: true
+                                                ).trim()
                                             }
                                         }
 
