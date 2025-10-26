@@ -38,22 +38,24 @@ pipeline {
                         try {
                             def json = new groovy.json.JsonSlurper().parseText(jsonContent)
                             echo "Parsed JSON: ${json}"
+
                             try {
                                 if (!json.jobs || json.jobs.isEmpty()) {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
+
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
+
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // ---- Cross-platform param wash (Windows: PowerShell, *nix: sh) ----
-                                        // 1) Flatten JSON params into plain strings first
+                                        // --------- Build clean String values for params ----------
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
                                             raw[(kv.name as String)] = (kv.value == null ? '' : kv.value.toString())
@@ -61,37 +63,31 @@ pipeline {
 
                                         def washed = [:]
                                         def keys = ['PARAM1','PARAM2','PARAM3','PARAM4']
+
                                         if (isUnix()) {
+                                            // On Unix, round-trip through sh to ensure plain Java Strings
                                             keys.each { k ->
                                                 def val = (raw[k] ?: '')
-                                                // escape double-quotes for sh
+                                                // escape double quotes for sh printf
                                                 def safe = val.replaceAll('"', '\\\\\"')
                                                 washed[k] = sh(script: "printf '%s' \"${safe}\"", returnStdout: true).trim()
                                             }
                                         } else {
-                                            // Windows: PowerShell here-string; escape single quotes inside value
+                                            // On Windows agents, values are already Strings; no sh available.
+                                            // Just assign directly (this does NOT pass any LazyMap objects).
                                             keys.each { k ->
-                                                def val = (raw[k] ?: '')
-                                                def valEsc = val.replace("'", "''")
-                                                // IMPORTANT: use $$ to emit a literal $ in a GString
-                                                def ps = "\$${'ErrorActionPreference'}='Stop'; " +
-                                                         "\$${'v'}=@'\n${valEsc}\n'@; " +
-                                                         "[Console]::Write(\$${'v'})"
-                                                washed[k] = bat(
-                                                    script: """powershell -NoProfile -Command "${ps}"""",
-                                                    returnStdout: true
-                                                ).trim()
+                                                washed[k] = (raw[k] ?: '')
                                             }
                                         }
+                                        // ----------------------------------------------------------
 
-                                        // 2) Build literal list of parameter step calls (no collect/closures)
+                                        // Literal list of parameter steps (avoid collect/closures)
                                         def jenkinsParams = [
                                             string(name: 'PARAM1', value: washed.PARAM1 ?: ''),
                                             string(name: 'PARAM2', value: washed.PARAM2 ?: ''),
                                             string(name: 'PARAM3', value: washed.PARAM3 ?: ''),
                                             string(name: 'PARAM4', value: washed.PARAM4 ?: '')
                                         ]
-                                        // -------------------------------------------------------------------
 
                                         echo "Triggering job 'optimized/queue' with parameters: ${jenkinsParams}"
 
@@ -104,15 +100,19 @@ pipeline {
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
+
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
+
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
+
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
+
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
