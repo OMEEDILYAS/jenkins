@@ -36,10 +36,10 @@ pipeline {
                         echo "JSON Content: ${jsonContent}"
 
                         try {
-                            // Parse with default JsonSlurper (returns LazyMap/LazyList)
+                            // Parse (produces LazyMap/LazyList)
                             def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
-                            // Convert to plain java.util.* (LinkedHashMap/ArrayList) to avoid LazyMap anywhere
-                            def json = toPlainCollections(parsed)
+                            // Sanitize: convert to plain java.util via literals (NO constructors)
+                            def json = plain(parsed)
 
                             echo "Parsed JSON (plain): ${json}"
 
@@ -48,18 +48,16 @@ pipeline {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
-
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
-
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // Build a simple name→string map from parameters
+                                        // Build simple name -> string map from parameters
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
                                             def key = (kv.name == null) ? '' : kv.name.toString()
@@ -67,7 +65,7 @@ pipeline {
                                             raw[key] = val
                                         }
 
-                                        // Construct explicit databound ParameterValue maps (plain java.util Maps)
+                                        // Databound ParameterValue maps (plain literals; no steps/collect)
                                         def jenkinsParams = [
                                             [$class: 'StringParameterValue', name: 'PARAM1', value: (raw['PARAM1'] ?: '')],
                                             [$class: 'StringParameterValue', name: 'PARAM2', value: (raw['PARAM2'] ?: '')],
@@ -75,8 +73,7 @@ pipeline {
                                             [$class: 'StringParameterValue', name: 'PARAM4', value: (raw['PARAM4'] ?: '')]
                                         ]
 
-                                        // IMPORTANT: use your real Jenkins job full name (breadcrumbs path)
-                                        def jobName = 'optimized/queue'
+                                        def jobName = 'optimized/queue'  // use your actual Jenkins job full name
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
                                         try {
@@ -84,23 +81,18 @@ pipeline {
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
-
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
-
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
-
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
-
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
-
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
@@ -112,26 +104,24 @@ pipeline {
 
 /**
  * Recursively convert Groovy JsonSlurper outputs (LazyMap/LazyList)
- * into plain java.util collections (LinkedHashMap/ArrayList) so
- * nothing Lazy leaks into Pipeline steps.
+ * into plain collections using ONLY literals ([:] and []) so the
+ * Script Security sandbox doesn't require approvals.
  */
 @NonCPS
-def toPlainCollections(Object o) {
+def plain(Object o) {
     if (o instanceof Map) {
-        def m = new LinkedHashMap()
+        def m = [:]                   // map literal (allowed)
         o.each { k, v ->
-            // keys from JSON are strings; ensure String keys
-            m.put(k?.toString(), toPlainCollections(v))
+            m[(k?.toString())] = plain(v)
         }
         return m
     } else if (o instanceof List) {
-        def l = new ArrayList()
+        def l = []                    // list literal (allowed)
         o.each { v ->
-            l.add(toPlainCollections(v))
+            l << plain(v)
         }
         return l
     } else {
-        // primitives/strings stay as-is
-        return (o == null) ? null : o
+        return (o == null) ? null : o // primitives/strings unchanged
     }
 }
