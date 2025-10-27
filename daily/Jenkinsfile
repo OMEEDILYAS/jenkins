@@ -1,4 +1,4 @@
-pipeline {
+/*pipeline {
   agent any
   options { timestamps() }
   triggers { cron('H H * * *') } // once per day (hashed hour/min)
@@ -58,4 +58,28 @@ def toPlain(Object o) {
   if (o instanceof Map)  { def m = [:]; o.each { k,v -> m[(k?.toString())] = toPlain(v) }; return m }
   if (o instanceof List) { def l = [];  o.each { v -> l << toPlain(v) }; return l }
   o
+}*/
+pipeline {
+  agent any
+  options { timestamps() }
+  triggers { cron('H H * * *') } // daily
+
+  stages {
+    stage('Send to queue') {
+      steps {
+        script {
+          def jsonText = readFile('daily/daily.json')
+          echo "Sending ${jsonText.length()} bytes from daily.json to queue"
+          build job: 'optimized/queue',
+                wait: false,
+                propagate: false,
+                parameters: [
+                  string(name: 'BATCH_JSON', value: jsonText),
+                  string(name: 'SOURCE',     value: 'daily')
+                ]
+        }
+      }
+    }
+  }
 }
+
