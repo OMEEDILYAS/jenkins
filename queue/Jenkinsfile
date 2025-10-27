@@ -1,10 +1,10 @@
 pipeline {
   agent any
-  options { timestamps() }
+  options { timestamps(); disableConcurrentBuilds() }
 
   parameters {
     string(name: 'BATCH_JSON', defaultValue: '', description: 'Raw JSON payload from a scheduler (jobs array).')
-    string(name: 'SOURCE',     defaultValue: '', description: 'Who sent this batch: every_15m | hourly | daily | weekly')
+    string(name: 'SOURCE',     defaultValue: '', description: 'every_15m | hourly | daily | weekly')
   }
 
   stages {
@@ -15,86 +15,226 @@ pipeline {
         script {
           echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
 
-          // Load current queue file (if any)
           def queuePath = 'queue/queue.json'
-          def existingText = fileExists(queuePath) ? readFile(queuePath) : '{"jobs": []}'
+          def existingText = fileExists(queuePath) ? readFile(queuePath) : ''
+          if (!existingText?.trim()) {
+            echo "Queue file missing/blank. Initializing to {\"jobs\":[], \"deadLetter\":[]}"
+            existingText = '{"jobs":[], "deadLetter":[]}'
+          }
 
-          // Merge and pretty-print (all parsing/sanitizing done in @NonCPS)
-          def mergedJson = mergeIntoQueue(existingText, params.BATCH_JSON, params.SOURCE)
-          def pretty     = groovy.json.JsonOutput.prettyPrint(mergedJson)
+          withQueueLock {
+            def curText = fileExists(queuePath) ? readFile(queuePath) : existingText
+            if (!curText?.trim()) curText = existingText
 
-          writeFile file: queuePath, text: pretty
-          echo "Queue updated at ${queuePath}"
+            def mergedJson = safeMerge(curText, params.BATCH_JSON, params.SOURCE)
+            def pretty = groovy.json.JsonOutput.prettyPrint(mergedJson)
+            writeFile file: queuePath, text: pretty
+            echo "Queue updated at ${queuePath}"
+          }
         }
       }
     }
 
-    stage('Process queue by priority') {
+    /* ==========================================================
+     * SINGLE WORKER PROCESSOR
+     * When you’re ready to add tokens (parallel processors),
+     * REPLACE this stage with the commented matrix block below.
+     * ========================================================== */
+    stage('Process queue (single worker)') {
       steps {
         script {
-          def queuePath = 'queue/queue.json'
-          if (!fileExists(queuePath)) {
-            echo "No queue file yet. Skipping."
-            return
-          }
-
-          def qText = readFile(queuePath)
-          def q     = parsePlain(qText) ?: [jobs: []]
-
-          def jobs = (q.jobs instanceof List) ? q.jobs : []
-          if (jobs.isEmpty()) {
-            echo "No queued jobs to process."
-            return
-          }
-
-          // Sort: priority DESC, then FIFO by receivedAt
-          jobs.sort { a, b ->
-            int pa = (a.priority ?: 0) as int
-            int pb = (b.priority ?: 0) as int
-            def byPrio = (pb <=> pa)
-            if (byPrio != 0) return byPrio
-            (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
-          }
-
-          def remaining = []
-          for (def j : jobs) {
-            try {
-              def jobName  = j.job.toString()
-              def waitFlag = !!j.wait
-              def params   = buildParams(j.parameters)
-
-              echo "▶ RUN ${j.name} from ${j.source} -> ${jobName} (priority=${j.priority}, wait=${waitFlag})"
-              build job: jobName, wait: waitFlag, propagate: true, parameters: params
-
-              echo "✔ DONE ${j.name}"
-              // consumed (do not re-add to remaining)
-
-            } catch (err) {
-              echo "✖ FAIL ${j?.name} : ${err?.message}"
-              // keep job in queue to retry next run
-              remaining << j
-            }
-          }
-
-          // Write back remaining (if any)
-          def newQueue = toJsonString([jobs: remaining])
-          writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newQueue)
-          echo "Queue processing complete. Remaining jobs: ${remaining.size()}"
+          workerLoop('1') // TOKEN = "1" for single processor
         }
       }
+    }
+
+    /* ===================== LATER: MATRIX VERSION =====================
+    stage('Process queue (tokens)') {
+      matrix {
+        axes {
+          axis {
+            name 'TOKEN'
+            values '1','2','3','4'  // <--- add/remove tokens here later
+          }
+        }
+        stages {
+          stage('Worker loop') {
+            steps {
+              script { workerLoop(env.TOKEN as String) }
+            }
+          }
+        }
+      }
+    }
+    =================================================================== */
+  }
+}
+
+/* ============================ Worker Logic ============================ */
+
+def workerLoop(String tokenId) {
+  def queuePath = 'queue/queue.json'
+  int idleRounds = 0
+  int maxIdleRounds = 3  // stop after a few idle checks
+
+  while (true) {
+    def jobItem = null
+
+    withQueueLock {
+      if (!fileExists(queuePath)) return
+      def qText = readFile(queuePath)
+      if (!qText?.trim()) return
+
+      def q = parsePlainSafe(qText) ?: [jobs: [], deadLetter: []]
+      if (!(q.jobs instanceof List)) q.jobs = []
+      if (!(q.deadLetter instanceof List)) q.deadLetter = []
+
+      // sort by priority DESC then FIFO by receivedAt
+      q.jobs.sort { a, b ->
+        int pa = (a.priority ?: 0) as int
+        int pb = (b.priority ?: 0) as int
+        def byPrio = (pb <=> pa)
+        if (byPrio != 0) return byPrio
+        (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
+      }
+
+      // find first not running (status null or 'queued')
+      int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
+      if (idx == -1) {
+        jobItem = null
+      } else {
+        // claim it
+        jobItem = q.jobs[idx]
+        jobItem.status    = 'running'
+        jobItem.processor = tokenId
+        jobItem.attempts  = ((jobItem.attempts ?: 0) as int) + 1
+
+        // write back with job marked running so no other worker can grab it
+        def newText = toJsonString([jobs: q.jobs, deadLetter: q.deadLetter])
+        writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newText)
+      }
+    } // lock released
+
+    if (jobItem == null) {
+      idleRounds++
+      if (idleRounds >= maxIdleRounds) {
+        echo "[TOKEN ${tokenId}] No jobs available. Exiting."
+        break
+      }
+      sleep time: 5, unit: 'SECONDS'
+      continue
+    }
+
+    idleRounds = 0 // we got work
+
+    // ---- Execute outside the lock ----
+    def jobName  = jobItem.job.toString()
+    def waitFlag = !!jobItem.wait
+    def params   = buildParams(jobItem.parameters)
+
+    echo "[TOKEN ${tokenId}] ▶ RUN ${jobItem.name} from ${jobItem.source} -> ${jobName} (priority=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
+
+    boolean ok = true
+    String errMsg = null
+    try {
+      build job: jobName, wait: waitFlag, propagate: true, parameters: params
+      echo "[TOKEN ${tokenId}] ✔ DONE ${jobItem.name}"
+    } catch (e) {
+      ok = false
+      errMsg = e.getMessage()
+      echo "[TOKEN ${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
+    }
+
+    // ---- Persist outcome ----
+    withQueueLock {
+      def qText2 = fileExists(queuePath) ? readFile(queuePath) : '{"jobs":[], "deadLetter":[]}'
+      def q2 = parsePlainSafe(qText2) ?: [jobs: [], deadLetter: []]
+      if (!(q2.jobs instanceof List)) q2.jobs = []
+      if (!(q2.deadLetter instanceof List)) q2.deadLetter = []
+
+      // find the running item (by name + receivedAt + processor) and update/remove
+      int idx2 = q2.jobs.findIndexOf {
+        it.name?.toString()      == jobItem.name?.toString() &&
+        (it.receivedAt ?: '')    == (jobItem.receivedAt ?: '') &&
+        (it.processor ?: '')     == tokenId &&
+        (it.status ?: '')        == 'running'
+      }
+
+      if (idx2 == -1) {
+        echo "[TOKEN ${tokenId}] WARN: Claimed item not found during finalize; writing best-effort state."
+        if (!ok) {
+          (q2.deadLetter as List) << (jobItem + [error: (errMsg ?: 'unknown')])
+        }
+      } else {
+        def running = q2.jobs.remove(idx2)
+
+        if (ok) {
+          // success: removed permanently
+        } else {
+          // failure: retry up to 3
+          int attempts = (running.attempts ?: 1) as int
+          if (attempts >= 3) {
+            running.status = 'failed'
+            running.error  = errMsg
+            (q2.deadLetter as List) << running
+          } else {
+            running.status    = 'queued'
+            running.processor = null
+            q2.jobs << running
+          }
+        }
+      }
+
+      def newText2 = toJsonString([jobs: q2.jobs, deadLetter: q2.deadLetter])
+      writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newText2)
     }
   }
 }
 
-/* ------------------------- helpers ------------------------- */
+/* ============================ Lock Helpers (Windows) ============================ */
 
-// Build PARAM1..4 for target jobs (CPS-safe)
+def withQueueLock(Closure body) {
+  def lockDir = "${pwd()}/queue/.lock"
+  lockDir = lockDir.replace('\\','/')
+
+  // Acquire
+  int attempts = 0
+  int maxAttempts = 120
+  while (true) {
+    int code = powershell(returnStatus: true, script: """
+      try {
+        New-Item -ItemType Directory -Path '${lockDir}' -ErrorAction Stop | Out-Null
+        exit 0
+      } catch {
+        exit 1
+      }
+    """.stripIndent())
+    if (code == 0) break
+    attempts++
+    if (attempts >= maxAttempts) {
+      error "Could not acquire queue lock at ${lockDir}"
+    }
+    sleep time: 1, unit: 'SECONDS'
+  }
+
+  try {
+    body.call()
+  } finally {
+    // Release
+    powershell script: """
+      try {
+        Remove-Item -LiteralPath '${lockDir}' -Force -Recurse -ErrorAction SilentlyContinue
+      } catch { }
+    """.stripIndent()
+  }
+}
+
+/* ============================ JSON Helpers ============================ */
+
 def buildParams(List plist) {
   def m = [:]
   (plist ?: []).each { kv ->
-    if (kv?.name) {
-      m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString())
-    }
+    if (kv?.name) m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString())
   }
   return [
     string(name: 'PARAM1', value: m['PARAM1'] ?: ''),
@@ -104,50 +244,47 @@ def buildParams(List plist) {
   ]
 }
 
-// @NonCPS: parse JSON and deep-convert LazyMap/LazyList -> plain collections
 @NonCPS
-def parsePlain(String jsonText) {
-  def p = new groovy.json.JsonSlurper().parseText(jsonText)
-  return toPlain(p)
+def safeMerge(String existingText, String batchText, String source) {
+  def existing = parsePlainSafe(existingText) ?: [jobs: [], deadLetter: []]
+  if (!(existing.jobs instanceof List)) existing.jobs = []
+  if (!(existing.deadLetter instanceof List)) existing.deadLetter = []
+
+  def batch = parsePlainSafe(batchText) ?: [jobs: []]
+  def now = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+
+  (batch.jobs ?: []).each { j ->
+    def item = toPlain(j) ?: [:]
+    if (!(item.parameters instanceof List)) item.parameters = []
+    item.source     = source?.toString()
+    item.receivedAt = now
+    item.status     = 'queued'
+    item.attempts   = 0
+    existing.jobs << item
+  }
+
+  return groovy.json.JsonOutput.toJson(existing)
+}
+
+@NonCPS
+def parsePlainSafe(String jsonText) {
+  if (!jsonText) return null
+  def t = jsonText.trim()
+  if (t.length() == 0) return null
+  try {
+    def p = new groovy.json.JsonSlurper().parseText(t)
+    return toPlain(p)
+  } catch (Throwable ignored) {
+    return null
+  }
 }
 
 @NonCPS
 def toPlain(Object o) {
-  if (o instanceof Map) {
-    def m = [:]
-    o.each { k, v -> m[(k?.toString())] = toPlain(v) }
-    return m
-  } else if (o instanceof List) {
-    def l = []
-    o.each { v -> l << toPlain(v) }
-    return l
-  } else {
-    return o
-  }
+  if (o instanceof Map)  { def m = [:]; o.each { k,v -> m[(k?.toString())] = toPlain(v) }; return m }
+  if (o instanceof List) { def l = [];  o.each { v -> l << toPlain(v) }; return l }
+  return o
 }
 
-// @NonCPS: merge a new batch into the existing queue; return JSON string (not maps)
 @NonCPS
-def mergeIntoQueue(String existingText, String batchText, String source) {
-  def existing = parsePlain(existingText) ?: [jobs: []]
-  def batch    = parsePlain(batchText)    ?: [jobs: []]
-
-  def list = (existing.jobs instanceof List) ? existing.jobs : []
-  def now  = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-
-  (batch.jobs ?: []).each { j ->
-    def item = toPlain(j) ?: [:]
-    if (!(item.parameters instanceof List)) { item.parameters = [] }
-    item.source     = source?.toString()
-    item.receivedAt = now
-    list << item
-  }
-
-  return groovy.json.JsonOutput.toJson([jobs: list])
-}
-
-// @NonCPS: turn plain object into JSON string
-@NonCPS
-def toJsonString(Object o) {
-  return groovy.json.JsonOutput.toJson(o)
-}
+def toJsonString(Object o) { groovy.json.JsonOutput.toJson(o) }
