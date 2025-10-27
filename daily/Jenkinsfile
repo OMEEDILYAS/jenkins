@@ -36,9 +36,9 @@ pipeline {
                         echo "JSON Content: ${jsonContent}"
 
                         try {
-                            // Parse (produces LazyMap/LazyList)
+                            // 1) Parse -> LazyMap/LazyList
                             def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
-                            // Sanitize: convert to plain java.util via literals (NO constructors)
+                            // 2) Sanitize -> plain maps/lists (no constructors → no script approval)
                             def json = plain(parsed)
 
                             echo "Parsed JSON (plain): ${json}"
@@ -48,51 +48,59 @@ pipeline {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
+
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
+
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // Build simple name -> string map from parameters
+                                        // Build a simple name->value String map from parameters
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
-                                            def key = (kv.name == null) ? '' : kv.name.toString()
-                                            def val = (kv.value == null) ? '' : kv.value.toString()
+                                            def key = kv?.name == null ? '' : kv.name.toString()
+                                            def val = kv?.value == null ? '' : kv.value.toString()
                                             raw[key] = val
                                         }
 
-                                        // Databound ParameterValue maps (plain literals; no steps/collect)
+                                        // Literal list of parameter steps (no collect/closures)
                                         def jenkinsParams = [
-                                            [$class: 'StringParameterValue', name: 'PARAM1', value: (raw['PARAM1'] ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM2', value: (raw['PARAM2'] ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM3', value: (raw['PARAM3'] ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM4', value: (raw['PARAM4'] ?: '')]
+                                            string(name: 'PARAM1', value: raw['PARAM1'] ?: ''),
+                                            string(name: 'PARAM2', value: raw['PARAM2'] ?: ''),
+                                            string(name: 'PARAM3', value: raw['PARAM3'] ?: ''),
+                                            string(name: 'PARAM4', value: raw['PARAM4'] ?: '')
                                         ]
 
-                                        def jobName = 'optimized/queue'  // use your actual Jenkins job full name
+                                        // IMPORTANT: real Jenkins job full name. From your logs: optimized » queue
+                                        def jobName = 'optimized/queue'
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
                                         try {
-                                            build wait: true, job: jobName, parameters: jenkinsParams
+                                            build job: jobName, wait: true, parameters: jenkinsParams
                                         } catch (Exception e) {
                                             error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
                                         }
+
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
+
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
+
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
+
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
+
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
@@ -103,25 +111,25 @@ pipeline {
 }
 
 /**
- * Recursively convert Groovy JsonSlurper outputs (LazyMap/LazyList)
- * into plain collections using ONLY literals ([:] and []) so the
- * Script Security sandbox doesn't require approvals.
+ * Recursively convert JsonSlurper results (LazyMap/LazyList) into plain
+ * collections using ONLY Groovy literals ([:] and []) so the Sandbox
+ * doesn’t require approvals and no Lazy objects leak to steps.
  */
 @NonCPS
 def plain(Object o) {
     if (o instanceof Map) {
-        def m = [:]                   // map literal (allowed)
+        def m = [:]
         o.each { k, v ->
-            m[(k?.toString())] = plain(v)
+            m[(k == null ? null : k.toString())] = plain(v)
         }
         return m
     } else if (o instanceof List) {
-        def l = []                    // list literal (allowed)
+        def l = []
         o.each { v ->
             l << plain(v)
         }
         return l
     } else {
-        return (o == null) ? null : o // primitives/strings unchanged
+        return o   // primitives/Strings unchanged
     }
 }
