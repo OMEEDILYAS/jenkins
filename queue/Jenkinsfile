@@ -1,27 +1,153 @@
 pipeline {
   agent any
-
-  // Declare the real parameters here (Jenkins will expose them on the job UI).
-  // Keep the job's UI "This project is parameterized" section empty; let this block define them.
-  parameters {
-    string(name: 'PARAM1', defaultValue: '', description: 'First parameter')
-    string(name: 'PARAM2', defaultValue: '', description: 'Second parameter')
-    string(name: 'PARAM3', defaultValue: '', description: 'Third parameter')
-    string(name: 'PARAM4', defaultValue: '', description: 'Fourth parameter')
-  }
-
   options { timestamps() }
 
+  parameters {
+    string(name: 'BATCH_JSON', defaultValue: '', description: 'Raw JSON payload from a scheduler (jobs array).')
+    string(name: 'SOURCE',     defaultValue: '', description: 'Who sent this batch: every_15m | hourly | daily | weekly')
+  }
+
   stages {
-    stage('Echo Params') {
+
+    stage('Ingest batch') {
+      when { expression { return params.BATCH_JSON?.trim() } }
       steps {
-        echo '=== QUEUE MARKER (parameterized) ==='
-        echo "JOB_NAME=${env.JOB_NAME}"
-        echo "PARAM1=${params.PARAM1}"
-        echo "PARAM2=${params.PARAM2}"
-        echo "PARAM3=${params.PARAM3}"
-        echo "PARAM4=${params.PARAM4}"
+        script {
+          echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
+
+          // Load current queue file (if any)
+          def queuePath = 'queue/queue.json'
+          def existingText = fileExists(queuePath) ? readFile(queuePath) : '{"jobs": []}'
+
+          // Merge and pretty-print (all parsing/sanitizing done in @NonCPS)
+          def mergedJson = mergeIntoQueue(existingText, params.BATCH_JSON, params.SOURCE)
+          def pretty     = groovy.json.JsonOutput.prettyPrint(mergedJson)
+
+          writeFile file: queuePath, text: pretty
+          echo "Queue updated at ${queuePath}"
+        }
+      }
+    }
+
+    stage('Process queue by priority') {
+      steps {
+        script {
+          def queuePath = 'queue/queue.json'
+          if (!fileExists(queuePath)) {
+            echo "No queue file yet. Skipping."
+            return
+          }
+
+          def qText = readFile(queuePath)
+          def q     = parsePlain(qText) ?: [jobs: []]
+
+          def jobs = (q.jobs instanceof List) ? q.jobs : []
+          if (jobs.isEmpty()) {
+            echo "No queued jobs to process."
+            return
+          }
+
+          // Sort: priority DESC, then FIFO by receivedAt
+          jobs.sort { a, b ->
+            int pa = (a.priority ?: 0) as int
+            int pb = (b.priority ?: 0) as int
+            def byPrio = (pb <=> pa)
+            if (byPrio != 0) return byPrio
+            (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
+          }
+
+          def remaining = []
+          for (def j : jobs) {
+            try {
+              def jobName  = j.job.toString()
+              def waitFlag = !!j.wait
+              def params   = buildParams(j.parameters)
+
+              echo "▶ RUN ${j.name} from ${j.source} -> ${jobName} (priority=${j.priority}, wait=${waitFlag})"
+              build job: jobName, wait: waitFlag, propagate: true, parameters: params
+
+              echo "✔ DONE ${j.name}"
+              // consumed (do not re-add to remaining)
+
+            } catch (err) {
+              echo "✖ FAIL ${j?.name} : ${err?.message}"
+              // keep job in queue to retry next run
+              remaining << j
+            }
+          }
+
+          // Write back remaining (if any)
+          def newQueue = toJsonString([jobs: remaining])
+          writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newQueue)
+          echo "Queue processing complete. Remaining jobs: ${remaining.size()}"
+        }
       }
     }
   }
+}
+
+/* ------------------------- helpers ------------------------- */
+
+// Build PARAM1..4 for target jobs (CPS-safe)
+def buildParams(List plist) {
+  def m = [:]
+  (plist ?: []).each { kv ->
+    if (kv?.name) {
+      m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString())
+    }
+  }
+  return [
+    string(name: 'PARAM1', value: m['PARAM1'] ?: ''),
+    string(name: 'PARAM2', value: m['PARAM2'] ?: ''),
+    string(name: 'PARAM3', value: m['PARAM3'] ?: ''),
+    string(name: 'PARAM4', value: m['PARAM4'] ?: '')
+  ]
+}
+
+// @NonCPS: parse JSON and deep-convert LazyMap/LazyList -> plain collections
+@NonCPS
+def parsePlain(String jsonText) {
+  def p = new groovy.json.JsonSlurper().parseText(jsonText)
+  return toPlain(p)
+}
+
+@NonCPS
+def toPlain(Object o) {
+  if (o instanceof Map) {
+    def m = [:]
+    o.each { k, v -> m[(k?.toString())] = toPlain(v) }
+    return m
+  } else if (o instanceof List) {
+    def l = []
+    o.each { v -> l << toPlain(v) }
+    return l
+  } else {
+    return o
+  }
+}
+
+// @NonCPS: merge a new batch into the existing queue; return JSON string (not maps)
+@NonCPS
+def mergeIntoQueue(String existingText, String batchText, String source) {
+  def existing = parsePlain(existingText) ?: [jobs: []]
+  def batch    = parsePlain(batchText)    ?: [jobs: []]
+
+  def list = (existing.jobs instanceof List) ? existing.jobs : []
+  def now  = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+
+  (batch.jobs ?: []).each { j ->
+    def item = toPlain(j) ?: [:]
+    if (!(item.parameters instanceof List)) { item.parameters = [] }
+    item.source     = source?.toString()
+    item.receivedAt = now
+    list << item
+  }
+
+  return groovy.json.JsonOutput.toJson([jobs: list])
+}
+
+// @NonCPS: turn plain object into JSON string
+@NonCPS
+def toJsonString(Object o) {
+  return groovy.json.JsonOutput.toJson(o)
 }
