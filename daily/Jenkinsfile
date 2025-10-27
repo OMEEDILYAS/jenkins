@@ -36,37 +36,40 @@ pipeline {
                         echo "JSON Content: ${jsonContent}"
 
                         try {
-                            def json = new groovy.json.JsonSlurper().parseText(jsonContent)
+                            // *** KEY CHANGE: avoid LazyMap entirely ***
+                            def json = readJSON(text: jsonContent)   // requires Pipeline Utility Steps (usually preinstalled)
                             echo "Parsed JSON: ${json}"
+
                             try {
-                                if (!json.jobs || json.jobs.isEmpty()) {
+                                if (!json.jobs || !(json.jobs instanceof List) || json.jobs.isEmpty()) {
                                     error "No jobs found in JSON."
                                 }
                                 echo "json is valid and parsed successfully."
+
                                 try {
                                     echo "processing jobs: ${params.OPTION}"
                                     def selectedJob = json.jobs.find { it.name == params.OPTION }
                                     if (!selectedJob) {
                                         error "Job '${params.OPTION}' not found in JSON."
                                     }
+
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // ---- Build clean databound maps (NOT steps, NOT JSON maps) ----
+                                        // Build clean databound ParameterValue maps (plain java.util maps)
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
                                             raw[(kv.name as String)] = (kv.value == null ? '' : kv.value.toString())
                                         }
 
-                                        // Construct exact ParameterValue databound maps
-                                        def jenkinsParams = []
-                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM1', value: (raw.PARAM1 ?: '')]
-                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM2', value: (raw.PARAM2 ?: '')]
-                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM3', value: (raw.PARAM3 ?: '')]
-                                        jenkinsParams << [$class: 'StringParameterValue', name: 'PARAM4', value: (raw.PARAM4 ?: '')]
-                                        // ----------------------------------------------------------------
+                                        def jenkinsParams = [
+                                            [$class: 'StringParameterValue', name: 'PARAM1', value: (raw.PARAM1 ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM2', value: (raw.PARAM2 ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM3', value: (raw.PARAM3 ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM4', value: (raw.PARAM4 ?: '')]
+                                        ]
 
-                                        // IMPORTANT: use the real Jenkins job full name
+                                        // Use the actual Jenkins job full name (breadcrumb path)
                                         def jobName = 'optimized/queue'
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
@@ -79,15 +82,19 @@ pipeline {
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
                                     }
+
                                 } catch (Exception e) {
                                     error "Error finding selected job: ${e.getMessage()}"
                                 }
+
                             } catch (Exception e) {
                                 error "Error parsing JSON content: ${e.getMessage()}"
                             }
+
                         } catch (Exception e) {
                             error "Error reading JSON file: ${e.getMessage()}"
                         }
+
                     } catch (Exception e) {
                         error "Unexpected error (must be the path): ${e.getMessage()}"
                     }
