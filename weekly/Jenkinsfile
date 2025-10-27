@@ -1,61 +1,23 @@
 pipeline {
   agent any
   options { timestamps() }
-  triggers { cron('H H * * 1') } // Mondays (hashed hour/min)
+  triggers { cron('H H * * 1') } // weekly (Mon). Adjust as needed.
 
   stages {
-    stage('Load jobs') {
+    stage('Send to queue') {
       steps {
         script {
           def jsonText = readFile('weekly/weekly.json')
-          J = parseJobs(jsonText)
-          if (!J || !(J instanceof List)) {
-            error "No jobs found in weekly.json"
-          }
-        }
-      }
-    }
-
-    stage('Run by priority') {
-      steps {
-        script {
-          J.sort { -(it.priority as int) }
-          for (def j : J) {
-            def jobName  = j.job.toString()
-            def waitFlag = !!j.wait
-            def params   = buildParams(j.parameters)
-
-            echo "▶ ${j.name} -> ${jobName} (priority=${j.priority}, wait=${waitFlag})"
-            build job: jobName, wait: waitFlag, propagate: true, parameters: params
-          }
+          echo "Sending ${jsonText.length()} bytes from weekly.json to queue"
+          build job: 'optimized/queue',
+                wait: false,
+                propagate: false,
+                parameters: [
+                  string(name: 'BATCH_JSON', value: jsonText),
+                  string(name: 'SOURCE',     value: 'weekly')
+                ]
         }
       }
     }
   }
-}
-
-def buildParams(List plist) {
-  def m = [:]
-  (plist ?: []).each { kv ->
-    if (kv?.name) m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString())
-  }
-  [
-    string(name: 'PARAM1', value: m['PARAM1'] ?: ''),
-    string(name: 'PARAM2', value: m['PARAM2'] ?: ''),
-    string(name: 'PARAM3', value: m['PARAM3'] ?: ''),
-    string(name: 'PARAM4', value: m['PARAM4'] ?: '')
-  ]
-}
-
-@NonCPS
-def parseJobs(String jsonText) {
-  def parsed = new groovy.json.JsonSlurper().parseText(jsonText)
-  toPlain(parsed)?.jobs
-}
-
-@NonCPS
-def toPlain(Object o) {
-  if (o instanceof Map)  { def m = [:]; o.each { k,v -> m[(k?.toString())] = toPlain(v) }; return m }
-  if (o instanceof List) { def l = [];  o.each { v -> l << toPlain(v) }; return l }
-  o
 }
