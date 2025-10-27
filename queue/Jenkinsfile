@@ -1,14 +1,16 @@
 pipeline {
   agent any
   parameters {
-    string(name: 'PARAM1', defaultValue: '', description: '')
-    string(name: 'PARAM2', defaultValue: '', description: '')
-    string(name: 'PARAM3', defaultValue: '', description: '')
-    string(name: 'PARAM4', defaultValue: '', description: '')
+    string(name: 'PARAM1', defaultValue: '')
+    string(name: 'PARAM2', defaultValue: '')
+    string(name: 'PARAM3', defaultValue: '')
+    string(name: 'PARAM4', defaultValue: '')
   }
+  options { timestamps() }
   stages {
-    stage('echo params') {
+    stage('MARKER') {
       steps {
+        echo '=== QUEUE MARKER v2 ==='
         echo "PARAM1=${params.PARAM1}"
         echo "PARAM2=${params.PARAM2}"
         echo "PARAM3=${params.PARAM3}"

@@ -80,16 +80,24 @@ pipeline {
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
                                         try {
-                                            build job: 'optimized/queue', wait: true, parameters: [
+                                            def r = build job: 'optimized/queue', wait: true, propagate: true, parameters: [
                                                 string(name: 'PARAM1', value: 'A'),
                                                 string(name: 'PARAM2', value: 'B'),
                                                 string(name: 'PARAM3', value: 'C'),
                                                 string(name: 'PARAM4', value: 'D')
                                             ]
-
-                                        } catch (Exception e) {
-                                            error "Failed to trigger job '${selectedJob.job}': ${e.getMessage()}"
+                                            echo "Downstream result: ${r?.result}"
+                                        } catch (err) {
+                                            echo "Downstream error class: ${err?.getClass()}"
+                                            echo "Downstream error message: ${err?.getMessage()}"
+                                            def c = err?.getCause()
+                                            if (c != null) {
+                                                echo "Cause class: ${c.getClass()}"
+                                                echo "Cause message: ${c.getMessage()}"
+                                            }
+                                            error "Upstream failing due to downstream error."
                                         }
+
 
                                     } catch (Exception e) {
                                         error "Error processing selected job: ${e.getMessage()}"
