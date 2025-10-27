@@ -11,9 +11,7 @@ pipeline {
 
     stages {
         stage('testing') {
-            steps {
-                echo "${BUILD_TRIGGER_BY}"
-            }
+            steps { echo "${BUILD_TRIGGER_BY}" }
         }
 
         stage('triggered by user') {
@@ -24,34 +22,13 @@ pipeline {
                     echo "Reading JSON file at: ${jsonPath}"
 
                     def jsonContent = readFile(jsonPath)
-                    echo "JSON Content: ${jsonContent}"
-
-                    // Parse JSON (JsonSlurper returns LazyMap), then sanitize to plain maps/lists
-                    def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
-                    def json = toPlain(parsed)
-                    echo "Parsed JSON (plain): ${json}"
-
-                    if (!json.jobs || !(json.jobs instanceof List) || json.jobs.isEmpty()) {
-                        error "No jobs found in JSON."
-                    }
-
-                    echo "processing jobs: ${params.OPTION}"
-                    def selectedJob = json.jobs.find { it.name == params.OPTION }
-                    if (!selectedJob) {
+                    // Parse+sanitize entirely in @NonCPS; no LazyMap leaks into CPS
+                    def raw = extractParams(jsonContent, params.OPTION)
+                    if (raw == null) {
                         error "Job '${params.OPTION}' not found in JSON."
                     }
 
-                    echo "Found job: ${selectedJob}"
-
-                    // Build simple name->value (Strings only)
-                    def raw = [:]
-                    (selectedJob.parameters ?: []).each { kv ->
-                        def key = kv?.name == null ? '' : kv.name.toString()
-                        def val = kv?.value == null ? '' : kv.value.toString()
-                        raw[key] = val
-                    }
-
-                    // Literal list of parameter steps (avoid closures/collect)
+                    // Build literal parameter steps from plain strings
                     def jenkinsParams = [
                         string(name: 'PARAM1', value: raw['PARAM1'] ?: ''),
                         string(name: 'PARAM2', value: raw['PARAM2'] ?: ''),
@@ -59,11 +36,10 @@ pipeline {
                         string(name: 'PARAM4', value: raw['PARAM4'] ?: '')
                     ]
 
-                    // Use the actual Jenkins job full name (folder path), not a repo path
-                    def jobName = 'optimized/queue'
+                    def jobName = 'optimized/queue'  // Jenkins job full name
                     echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
-                    // Wait for downstream; if it fails, bubble the error up
+                    // Wait and propagate result
                     build job: jobName, wait: true, propagate: true, parameters: jenkinsParams
                 }
             }
@@ -71,7 +47,24 @@ pipeline {
     }
 }
 
-// Recursively convert JsonSlurper results (LazyMap/LazyList) into plain collections using only literals
+/** Parse JSON and return a plain String map of PARAM1..4 for the selected job. */
+@NonCPS
+def extractParams(String jsonText, String optionName) {
+    def parsed = new groovy.json.JsonSlurper().parseText(jsonText)  // LazyMap
+    def j = toPlain(parsed)  // convert to plain java.util collections
+    if (!(j.jobs instanceof List) || j.jobs.isEmpty()) return null
+    def selected = j.jobs.find { it.name?.toString() == optionName?.toString() }
+    if (!selected) return null
+
+    def out = [:]
+    (selected.parameters ?: []).each { kv ->
+        def key = kv?.name?.toString()
+        if (key) out[key] = kv?.value == null ? '' : kv.value.toString()
+    }
+    return out
+}
+
+/** Deep-convert LazyMap/LazyList -> plain Map/List using literals only (no constructors). */
 @NonCPS
 def toPlain(Object o) {
     if (o instanceof Map) {
