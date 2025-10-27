@@ -36,9 +36,12 @@ pipeline {
                         echo "JSON Content: ${jsonContent}"
 
                         try {
-                            // *** KEY CHANGE: avoid LazyMap entirely ***
-                            def json = readJSON(text: jsonContent)   // requires Pipeline Utility Steps (usually preinstalled)
-                            echo "Parsed JSON: ${json}"
+                            // Parse with default JsonSlurper (returns LazyMap/LazyList)
+                            def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
+                            // Convert to plain java.util.* (LinkedHashMap/ArrayList) to avoid LazyMap anywhere
+                            def json = toPlainCollections(parsed)
+
+                            echo "Parsed JSON (plain): ${json}"
 
                             try {
                                 if (!json.jobs || !(json.jobs instanceof List) || json.jobs.isEmpty()) {
@@ -56,20 +59,23 @@ pipeline {
                                     try {
                                         echo "Found job: ${selectedJob}"
 
-                                        // Build clean databound ParameterValue maps (plain java.util maps)
+                                        // Build a simple name→string map from parameters
                                         def raw = [:]
                                         (selectedJob.parameters ?: []).each { kv ->
-                                            raw[(kv.name as String)] = (kv.value == null ? '' : kv.value.toString())
+                                            def key = (kv.name == null) ? '' : kv.name.toString()
+                                            def val = (kv.value == null) ? '' : kv.value.toString()
+                                            raw[key] = val
                                         }
 
+                                        // Construct explicit databound ParameterValue maps (plain java.util Maps)
                                         def jenkinsParams = [
-                                            [$class: 'StringParameterValue', name: 'PARAM1', value: (raw.PARAM1 ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM2', value: (raw.PARAM2 ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM3', value: (raw.PARAM3 ?: '')],
-                                            [$class: 'StringParameterValue', name: 'PARAM4', value: (raw.PARAM4 ?: '')]
+                                            [$class: 'StringParameterValue', name: 'PARAM1', value: (raw['PARAM1'] ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM2', value: (raw['PARAM2'] ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM3', value: (raw['PARAM3'] ?: '')],
+                                            [$class: 'StringParameterValue', name: 'PARAM4', value: (raw['PARAM4'] ?: '')]
                                         ]
 
-                                        // Use the actual Jenkins job full name (breadcrumb path)
+                                        // IMPORTANT: use your real Jenkins job full name (breadcrumbs path)
                                         def jobName = 'optimized/queue'
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
@@ -101,5 +107,31 @@ pipeline {
                 }
             }
         }
+    }
+}
+
+/**
+ * Recursively convert Groovy JsonSlurper outputs (LazyMap/LazyList)
+ * into plain java.util collections (LinkedHashMap/ArrayList) so
+ * nothing Lazy leaks into Pipeline steps.
+ */
+@NonCPS
+def toPlainCollections(Object o) {
+    if (o instanceof Map) {
+        def m = new LinkedHashMap()
+        o.each { k, v ->
+            // keys from JSON are strings; ensure String keys
+            m.put(k?.toString(), toPlainCollections(v))
+        }
+        return m
+    } else if (o instanceof List) {
+        def l = new ArrayList()
+        o.each { v ->
+            l.add(toPlainCollections(v))
+        }
+        return l
+    } else {
+        // primitives/strings stay as-is
+        return (o == null) ? null : o
     }
 }
