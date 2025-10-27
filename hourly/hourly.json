@@ -1,0 +1,69 @@
+{
+    "jobs": [
+        {
+            "name": "twenty",
+            "category": "hourly",
+            "priority": 8,
+            "wait": true,
+            "job": "optimized/queue",
+            "parameters": [
+                { "name": "PARAM1", "value": "cinnamon-breeze-42" },
+                { "name": "PARAM2", "value": "marble-sunset-7" },
+                { "name": "PARAM3", "value": "echo-lake-991" },
+                { "name": "PARAM4", "value": "violet-orbit-314" }
+            ]
+        },
+        {
+            "name": "twentyone",
+            "category": "hourly",
+            "priority": 8,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "ocean-whisper-101" },
+                { "name": "PARAM2", "value": "paper-lantern-202" },
+                { "name": "PARAM3", "value": "glass-harbor-303" },
+                { "name": "PARAM4", "value": "silver-thread-404" }
+            ]
+        },
+        {
+            "name": "twentytwo",
+            "category": "hourly",
+            "priority": 8,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "quartz-meadow-55" },
+                { "name": "PARAM2", "value": "ember-field-66" },
+                { "name": "PARAM3", "value": "sage-breeze-77" },
+                { "name": "PARAM4", "value": "nebula-drift-88" }
+            ]
+        },
+        {
+            "name": "twentythree",
+            "category": "hourly",
+            "priority": 8,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "maple-accordion-1" },
+                { "name": "PARAM2", "value": "cobalt-waltz-2" },
+                { "name": "PARAM3", "value": "lunar-kite-3" },
+                { "name": "PARAM4", "value": "opal-echo-4" }
+            ]
+        },
+        {
+            "name": "twentyfour",
+            "category": "hourly",
+            "priority": 8,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "jade-spiral-A" },
+                { "name": "PARAM2", "value": "cerulean-tide-B" },
+                { "name": "PARAM3", "value": "tangerine-sky-C" },
+                { "name": "PARAM4", "value": "minty-quantum-D" }
+            ]
+        }
+    ]
+}

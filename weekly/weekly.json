@@ -1,0 +1,69 @@
+{
+    "jobs": [
+        {
+            "name": "thirty",
+            "category": "weekly",
+            "priority": 4,
+            "wait": true,
+            "job": "optimized/queue",
+            "parameters": [
+                { "name": "PARAM1", "value": "rainbow" },
+                { "name": "PARAM2", "value": "mountain" },
+                { "name": "PARAM3", "value": "ocean" },
+                { "name": "PARAM4", "value": "forest" }
+            ]
+        },
+        {
+            "name": "thirtyone",
+            "category": "weekly",
+            "priority": 4,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "guitar" },
+                { "name": "PARAM2", "value": "piano" },
+                { "name": "PARAM3", "value": "drums" },
+                { "name": "PARAM4", "value": "violin" }
+            ]
+        },
+        {
+            "name": "thirtytwo",
+            "category": "weekly",
+            "priority": 4,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "elephant" },
+                { "name": "PARAM2", "value": "giraffe" },
+                { "name": "PARAM3", "value": "penguin" },
+                { "name": "PARAM4", "value": "dolphin" }
+            ]
+        },
+        {
+            "name": "thirtythree",
+            "category": "weekly",
+            "priority": 4,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "computer" },
+                { "name": "PARAM2", "value": "keyboard" },
+                { "name": "PARAM3", "value": "monitor" },
+                { "name": "PARAM4", "value": "mouse" }
+            ]
+        },
+        {
+            "name": "thirtyfour",
+            "category": "weekly",
+            "priority": 4,
+            "job": "optimized/queue",
+            "wait": true,
+            "parameters": [
+                { "name": "PARAM1", "value": "castle" },
+                { "name": "PARAM2", "value": "bridge" },
+                { "name": "PARAM3", "value": "tower" },
+                { "name": "PARAM4", "value": "garden" }
+            ]
+        }
+    ]
+}

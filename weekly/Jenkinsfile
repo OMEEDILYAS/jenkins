@@ -1,16 +1,16 @@
 pipeline {
   agent any
   options { timestamps() }
-  triggers { cron('H H * * *') } // once per day (hashed hour/min)
+  triggers { cron('H H * * 1') } // Mondays (hashed hour/min)
 
   stages {
     stage('Load jobs') {
       steps {
         script {
-          def jsonText = readFile('daily/daily.json')
+          def jsonText = readFile('weekly/weekly.json')
           J = parseJobs(jsonText)
           if (!J || !(J instanceof List)) {
-            error "No jobs found in daily.json"
+            error "No jobs found in weekly.json"
           }
         }
       }

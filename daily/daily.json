@@ -2,7 +2,10 @@
   "jobs": [
     {
       "name": "one",
-      "job": "queue/Jenkinsfile",
+      "category": "daily",
+      "priority": 6,
+      "wait": true,
+      "job": "optimized/queue",
       "parameters": [
         { "name": "PARAM1", "value": "alpha" },
         { "name": "PARAM2", "value": "beta" },
@@ -12,12 +15,54 @@
     },
     {
       "name": "two",
-      "job": "queue/Jenkinsfile",
+      "category": "daily",
+      "priority": 6,
+      "job": "optimized/queue",
+      "wait": true,
       "parameters": [
         { "name": "PARAM1", "value": "x" },
         { "name": "PARAM2", "value": "y" },
         { "name": "PARAM3", "value": "z" },
         { "name": "PARAM4", "value": "v" }
+      ]
+    },
+    {
+      "name": "three",
+      "category": "daily",
+      "priority": 6,
+      "job": "optimized/queue",
+      "wait": true,
+      "parameters": [
+        { "name": "PARAM1", "value": "red" },
+        { "name": "PARAM2", "value": "blue" },
+        { "name": "PARAM3", "value": "green" },
+        { "name": "PARAM4", "value": "yellow" }
+      ]
+    },
+    {
+      "name": "four",
+      "category": "daily",
+      "priority": 6,
+      "job": "optimized/queue",
+      "wait": true,
+      "parameters": [
+        { "name": "PARAM1", "value": "one" },
+        { "name": "PARAM2", "value": "two" },
+        { "name": "PARAM3", "value": "three" },
+        { "name": "PARAM4", "value": "four" }
+      ]
+    },
+    {
+      "name": "five",
+      "category": "daily",
+      "priority": 6,
+      "job": "optimized/queue",
+      "wait": true,
+      "parameters": [
+        { "name": "PARAM1", "value": "spring" },
+        { "name": "PARAM2", "value": "summer" },
+        { "name": "PARAM3", "value": "autumn" },
+        { "name": "PARAM4", "value": "winter" }
       ]
     }
   ]

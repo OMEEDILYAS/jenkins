@@ -1,0 +1,61 @@
+pipeline {
+  agent any
+  options { timestamps() }
+  triggers { cron('H/15 * * * *') } // adjust TZ in job config if needed
+
+  stages {
+    stage('Load jobs') {
+      steps {
+        script {
+          J = loadJobs('every_15m/every_15m.json')   // List<Map> (plain, no LazyMap)
+        }
+      }
+    }
+    stage('Run by priority') {
+      steps {
+        script {
+          J.sort { -(it.priority as int) }   // highest first
+          for (def j : J) {
+            def p = paramList(j.parameters)  // List of string(...) steps
+            def jobName = j.job.toString()
+            boolean waitFlag = !!j.wait
+            echo "▶ ${j.name} -> ${jobName} (priority=${j.priority}, wait=${waitFlag})"
+            build job: jobName, wait: waitFlag, propagate: true, parameters: p
+          }
+        }
+      }
+    }
+  }
+}
+
+@NonCPS
+def loadJobs(String jsonPath) {
+  def txt = new File(jsonPath).text
+  def parsed = new groovy.json.JsonSlurper().parseText(txt)
+  def plain = toPlain(parsed)         // map/list literals only
+  def arr = plain?.jobs
+  if (!(arr instanceof List) || arr.isEmpty()) {
+    throw new RuntimeException("No jobs found in ${jsonPath}")
+  }
+  return arr
+}
+
+def paramList(List plist) {
+  def m = [:]
+  (plist ?: []).each { kv ->
+    if (kv?.name) { m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString()) }
+  }
+  return [
+    string(name: 'PARAM1', value: m['PARAM1'] ?: ''),
+    string(name: 'PARAM2', value: m['PARAM2'] ?: ''),
+    string(name: 'PARAM3', value: m['PARAM3'] ?: ''),
+    string(name: 'PARAM4', value: m['PARAM4'] ?: '')
+  ]
+}
+
+@NonCPS
+def toPlain(Object o) {
+  if (o instanceof Map) { def m=[:]; o.each{ k,v-> m[(k?.toString())]=toPlain(v)}; return m }
+  if (o instanceof List){ def l=[];  o.each{ v-> l<<toPlain(v)}; return l }
+  return o
+}
