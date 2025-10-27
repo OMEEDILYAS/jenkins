@@ -80,7 +80,7 @@ pipeline {
                                         echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
 
                                         try {
-                                            def r = build job: 'queue-clean', wait: true, propagate: true, parameters: [
+                                            def r = build job: 'optimized/queue', wait: true, propagate: true, parameters: [
                                                 string(name: 'PARAM1', value: 'A'),
                                                 string(name: 'PARAM2', value: 'B'),
                                                 string(name: 'PARAM3', value: 'C'),
