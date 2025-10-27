@@ -1,149 +1,88 @@
 pipeline {
     agent any
-    /*triggers {
-        cron '''TZ=America/Chicago
-            * * * * *'''
-    }*/
+
     parameters {
-        choice(choices: ['one', 'two'], description: 'Select an option', name: 'OPTION')
+        choice(name: 'OPTION', choices: ['one', 'two'], description: 'Select an option')
     }
+
     environment {
         BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId ?: 'SYSTEM'}"
     }
+
     stages {
         stage('testing') {
             steps {
-                script {
-                    try {
-                        echo "${BUILD_TRIGGER_BY}"
-                    } catch (Exception e) {
-                        echo "Error: ${e.getMessage()}"
-                    }
-                }
+                echo "${BUILD_TRIGGER_BY}"
             }
         }
+
         stage('triggered by user') {
-            when {
-                expression { BUILD_TRIGGER_BY != 'SYSTEM' }
-            }
+            when { expression { BUILD_TRIGGER_BY != 'SYSTEM' } }
             steps {
                 script {
-                    try {
-                        def jsonPath = 'daily/daily.json'
-                        echo "Reading JSON file at: ${jsonPath}"
+                    def jsonPath = 'daily/daily.json'
+                    echo "Reading JSON file at: ${jsonPath}"
 
-                        def jsonContent = readFile(jsonPath)
-                        echo "JSON Content: ${jsonContent}"
+                    def jsonContent = readFile(jsonPath)
+                    echo "JSON Content: ${jsonContent}"
 
-                        try {
-                            // 1) Parse -> LazyMap/LazyList
-                            def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
-                            // 2) Sanitize -> plain maps/lists (no constructors → no script approval)
-                            def json = plain(parsed)
+                    // Parse JSON (JsonSlurper returns LazyMap), then sanitize to plain maps/lists
+                    def parsed = new groovy.json.JsonSlurper().parseText(jsonContent)
+                    def json = toPlain(parsed)
+                    echo "Parsed JSON (plain): ${json}"
 
-                            echo "Parsed JSON (plain): ${json}"
-
-                            try {
-                                if (!json.jobs || !(json.jobs instanceof List) || json.jobs.isEmpty()) {
-                                    error "No jobs found in JSON."
-                                }
-                                echo "json is valid and parsed successfully."
-
-                                try {
-                                    echo "processing jobs: ${params.OPTION}"
-                                    def selectedJob = json.jobs.find { it.name == params.OPTION }
-                                    if (!selectedJob) {
-                                        error "Job '${params.OPTION}' not found in JSON."
-                                    }
-
-                                    try {
-                                        echo "Found job: ${selectedJob}"
-
-                                        // Build a simple name->value String map from parameters
-                                        def raw = [:]
-                                        (selectedJob.parameters ?: []).each { kv ->
-                                            def key = kv?.name == null ? '' : kv.name.toString()
-                                            def val = kv?.value == null ? '' : kv.value.toString()
-                                            raw[key] = val
-                                        }
-
-                                        // Literal list of parameter steps (no collect/closures)
-                                        def jenkinsParams = [
-                                            string(name: 'PARAM1', value: raw['PARAM1'] ?: ''),
-                                            string(name: 'PARAM2', value: raw['PARAM2'] ?: ''),
-                                            string(name: 'PARAM3', value: raw['PARAM3'] ?: ''),
-                                            string(name: 'PARAM4', value: raw['PARAM4'] ?: '')
-                                        ]
-
-                                        // IMPORTANT: real Jenkins job full name. From your logs: optimized » queue
-                                        def jobName = 'optimized/queue'
-                                        echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
-
-                                        try {
-                                            def r = build job: 'optimized/queue', wait: true, propagate: true, parameters: [
-                                                string(name: 'PARAM1', value: 'A'),
-                                                string(name: 'PARAM2', value: 'B'),
-                                                string(name: 'PARAM3', value: 'C'),
-                                                string(name: 'PARAM4', value: 'D')
-                                            ]
-                                            echo "Downstream result: ${r?.result}"
-                                        } catch (err) {
-                                            echo "Downstream error class: ${err?.getClass()}"
-                                            echo "Downstream error message: ${err?.getMessage()}"
-                                            def c = err?.getCause()
-                                            if (c != null) {
-                                                echo "Cause class: ${c.getClass()}"
-                                                echo "Cause message: ${c.getMessage()}"
-                                            }
-                                            error "Upstream failing due to downstream error."
-                                        }
-
-
-                                    } catch (Exception e) {
-                                        error "Error processing selected job: ${e.getMessage()}"
-                                    }
-
-                                } catch (Exception e) {
-                                    error "Error finding selected job: ${e.getMessage()}"
-                                }
-
-                            } catch (Exception e) {
-                                error "Error parsing JSON content: ${e.getMessage()}"
-                            }
-
-                        } catch (Exception e) {
-                            error "Error reading JSON file: ${e.getMessage()}"
-                        }
-
-                    } catch (Exception e) {
-                        error "Unexpected error (must be the path): ${e.getMessage()}"
+                    if (!json.jobs || !(json.jobs instanceof List) || json.jobs.isEmpty()) {
+                        error "No jobs found in JSON."
                     }
+
+                    echo "processing jobs: ${params.OPTION}"
+                    def selectedJob = json.jobs.find { it.name == params.OPTION }
+                    if (!selectedJob) {
+                        error "Job '${params.OPTION}' not found in JSON."
+                    }
+
+                    echo "Found job: ${selectedJob}"
+
+                    // Build simple name->value (Strings only)
+                    def raw = [:]
+                    (selectedJob.parameters ?: []).each { kv ->
+                        def key = kv?.name == null ? '' : kv.name.toString()
+                        def val = kv?.value == null ? '' : kv.value.toString()
+                        raw[key] = val
+                    }
+
+                    // Literal list of parameter steps (avoid closures/collect)
+                    def jenkinsParams = [
+                        string(name: 'PARAM1', value: raw['PARAM1'] ?: ''),
+                        string(name: 'PARAM2', value: raw['PARAM2'] ?: ''),
+                        string(name: 'PARAM3', value: raw['PARAM3'] ?: ''),
+                        string(name: 'PARAM4', value: raw['PARAM4'] ?: '')
+                    ]
+
+                    // Use the actual Jenkins job full name (folder path), not a repo path
+                    def jobName = 'optimized/queue'
+                    echo "Triggering job '${jobName}' with parameters: ${jenkinsParams}"
+
+                    // Wait for downstream; if it fails, bubble the error up
+                    build job: jobName, wait: true, propagate: true, parameters: jenkinsParams
                 }
             }
         }
     }
 }
 
-/**
- * Recursively convert JsonSlurper results (LazyMap/LazyList) into plain
- * collections using ONLY Groovy literals ([:] and []) so the Sandbox
- * doesn’t require approvals and no Lazy objects leak to steps.
- */
+// Recursively convert JsonSlurper results (LazyMap/LazyList) into plain collections using only literals
 @NonCPS
-def plain(Object o) {
+def toPlain(Object o) {
     if (o instanceof Map) {
         def m = [:]
-        o.each { k, v ->
-            m[(k == null ? null : k.toString())] = plain(v)
-        }
+        o.each { k, v -> m[(k == null ? null : k.toString())] = toPlain(v) }
         return m
     } else if (o instanceof List) {
         def l = []
-        o.each { v ->
-            l << plain(v)
-        }
+        o.each { v -> l << toPlain(v) }
         return l
     } else {
-        return o   // primitives/Strings unchanged
+        return o
     }
 }

@@ -1,16 +1,17 @@
 pipeline {
-    agent any
-    stages {
-        stage('Dry Run and Logging') {
-            steps {
-                script {
-                    echo "DOWNSTREAM STARTED ✅"
-                    echo "PARAM1=${params.PARAM1}"
-                    echo "PARAM2=${params.PARAM2}"
-                    echo "PARAM3=${params.PARAM3}"
-                    echo "PARAM4=${params.PARAM4}"
-                }
-            }
-        }
+  agent any
+  options { timestamps() }
+
+  stages {
+    stage('Echo Params') {
+      steps {
+        echo '=== QUEUE MARKER ==='
+        echo "JOB_NAME=${env.JOB_NAME}"
+        echo "PARAM1=${params.PARAM1}"
+        echo "PARAM2=${params.PARAM2}"
+        echo "PARAM3=${params.PARAM3}"
+        echo "PARAM4=${params.PARAM4}"
+      }
     }
+  }
 }
