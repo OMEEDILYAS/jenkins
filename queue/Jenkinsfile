@@ -1,38 +1,19 @@
 pipeline {
-    agent any
-
-    options {
-        timestamps()
+  agent any
+  parameters {
+    string(name: 'PARAM1', defaultValue: '', description: '')
+    string(name: 'PARAM2', defaultValue: '', description: '')
+    string(name: 'PARAM3', defaultValue: '', description: '')
+    string(name: 'PARAM4', defaultValue: '', description: '')
+  }
+  stages {
+    stage('echo params') {
+      steps {
+        echo "PARAM1=${params.PARAM1}"
+        echo "PARAM2=${params.PARAM2}"
+        echo "PARAM3=${params.PARAM3}"
+        echo "PARAM4=${params.PARAM4}"
+      }
     }
-
-    stages {
-        stage('Read Queue') {
-            steps {
-                script {
-                    def jsonPath = 'queue/queue.json'
-                    echo "Reading queue file: ${jsonPath}"
-
-                    try {
-                        def raw = readFile(jsonPath)
-                        def parsed = new groovy.json.JsonSlurper().parseText(raw)
-
-                        if (!parsed?.jobs || !(parsed.jobs instanceof List)) {
-                            echo "Queue file has no jobs. Nothing to process."
-                            return
-                        }
-
-                        echo "✅ Found ${parsed.jobs.size()} job(s) in queue:"
-                        parsed.jobs.each { j ->
-                            echo " - name='${j.name}', job='${j.job}'"
-                        }
-
-                        echo "✅ Dry run complete. No job executions attempted."
-                    } catch (e) {
-                        echo "❌ Error reading or parsing queue: ${e.getMessage()}"
-                        error "Stopping due to error."
-                    }
-                }
-            }
-        }
-    }
+  }
 }
