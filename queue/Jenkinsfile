@@ -1,11 +1,21 @@
 pipeline {
   agent any
+
+  // Declare the real parameters here (Jenkins will expose them on the job UI).
+  // Keep the job's UI "This project is parameterized" section empty; let this block define them.
+  parameters {
+    string(name: 'PARAM1', defaultValue: '', description: 'First parameter')
+    string(name: 'PARAM2', defaultValue: '', description: 'Second parameter')
+    string(name: 'PARAM3', defaultValue: '', description: 'Third parameter')
+    string(name: 'PARAM4', defaultValue: '', description: 'Fourth parameter')
+  }
+
   options { timestamps() }
 
   stages {
     stage('Echo Params') {
       steps {
-        echo '=== QUEUE MARKER ==='
+        echo '=== QUEUE MARKER (parameterized) ==='
         echo "JOB_NAME=${env.JOB_NAME}"
         echo "PARAM1=${params.PARAM1}"
         echo "PARAM2=${params.PARAM2}"
