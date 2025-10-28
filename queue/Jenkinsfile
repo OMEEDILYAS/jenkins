@@ -1,12 +1,26 @@
-// Jenkinsfile — Option B: shared queue via stash/unstash + improvements
+/*
+  Queue is centralized on one node (usually the controller/built-in),
+  and all reads/writes happen there under a simple filesystem mutex.
+  No Lockable Resources plugin needed.
+
+  Setup:
+    1) Make sure the QUEUE_NODE exists (built-in is fine).
+    2) Ensure QUEUE_DIR exists or let this job create it (it writes there).
+*/
+
+def QUEUE_NODE = 'built-in'                 // or label of a dedicated fileshare node
+def QUEUE_DIR  = 'queue-shared'             // folder under that node's workspace
+def QUEUE_FILE = 'queue.json'
+def LOCK_DIR   = '.lock'                    // fs mutex dir inside QUEUE_DIR
+
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
   parameters {
-    string(name: 'BATCH_JSON', defaultValue: '', description: 'Raw JSON payload from a scheduler (jobs array).')
-    string(name: 'SOURCE',     defaultValue: '', description: 'every_15m | hourly | daily | weekly')
-    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'How many 5s idle checks before a worker leg exits (default ~2min).')
+    string(name: 'BATCH_JSON',  defaultValue: '', description: 'Raw JSON payload from scheduler (jobs array).')
+    string(name: 'SOURCE',      defaultValue: '', description: 'every_15m | hourly | daily | weekly')
+    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'How many 5s idle checks before a worker leg exits.')
   }
 
   stages {
@@ -15,21 +29,11 @@ pipeline {
       steps {
         script {
           echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
-
-          withStashedQueue {
-            // Load or init
-            def qText = fileExists('queue.json') ? readFile('queue.json') : ''
-            if (!qText?.trim()) {
-              qText = '{"jobs":[],"deadLetter":[]}'
-            }
-
-            // Merge new jobs
+          withCentralQueue {
+            def qText = fileExists(QUEUE_FILE) ? readFile(QUEUE_FILE) : '{"jobs":[],"deadLetter":[]}'
             def merged = safeMerge(qText, params.BATCH_JSON, params.SOURCE)
-            def pretty = groovy.json.JsonOutput.prettyPrint(merged)
-
-            writeFile file: 'queue.json', text: pretty
+            writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(merged)
           }
-
           echo "Queue updated."
         }
       }
@@ -40,7 +44,7 @@ pipeline {
         axes {
           axis {
             name 'TOKEN'
-            values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
+            values 'agent-1','agent-2','agent-3','agent-4'
           }
         }
         agent { label "${TOKEN}" }
@@ -48,7 +52,9 @@ pipeline {
         stages {
           stage('Worker loop') {
             steps {
-              script { workerLoop(env.TOKEN as String, (params.IDLE_ROUNDS ?: '24') as int) }
+              script {
+                workerLoop(env.TOKEN as String, (params.IDLE_ROUNDS ?: '24') as int)
+              }
             }
           }
         }
@@ -63,59 +69,31 @@ def workerLoop(String tokenId, int maxIdleRounds) {
   int idleRounds = 0
 
   while (true) {
-    def jobItem = null
-
-    // -------- Claim a job (under lock; queue materialized via unstash) --------
-    withStashedQueue {
-      def qText = fileExists('queue.json') ? readFile('queue.json') : '{"jobs":[],"deadLetter":[]}'
-      def q = parsePlainSafe(qText) ?: [jobs: [], deadLetter: []]
-      if (!(q.jobs instanceof List)) q.jobs = []
-      if (!(q.deadLetter instanceof List)) q.deadLetter = []
-
-      // Highest priority first; FIFO by receivedAt within same priority
-      q.jobs.sort { a, b ->
-        int pa = (a.priority ?: 0) as int
-        int pb = (b.priority ?: 0) as int
-        def byPrio = (pb <=> pa)
-        if (byPrio != 0) return byPrio
-        (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
-      }
-
-      // Find first non-running job
-      int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
-      if (idx != -1) {
-        jobItem = q.jobs[idx]
-        jobItem.status    = 'running'
-        jobItem.processor = tokenId
-        jobItem.attempts  = ((jobItem.attempts ?: 0) as int) + 1
-        // Persist claim
-        writeFile file: 'queue.json', text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs: q.jobs, deadLetter: q.deadLetter]))
-      }
-    } // lock releases here
+    def jobItem = claimOne(tokenId)   // claim atomically on QUEUE_NODE
 
     if (jobItem == null) {
       idleRounds++
       if (idleRounds >= Math.max(1, maxIdleRounds)) {
-        echo "[${tokenId}] No jobs available after ${idleRounds} checks. Exiting."
+        echo "[${tokenId}] No jobs after ${idleRounds} checks. Exiting."
         break
       }
       sleep time: 5, unit: 'SECONDS'
       continue
     }
 
-    idleRounds = 0 // got work
+    idleRounds = 0
 
-    // ---- Execute outside the lock ----
+    // ---- Execute outside queue critical section ----
     def jobName  = jobItem.job?.toString()
     def waitFlag = !!jobItem.wait
-    def params   = buildParams(jobItem.parameters)
+    def p        = buildParams(jobItem.parameters)
 
     echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
 
     boolean ok = true
     String errMsg = null
     try {
-      build job: jobName, wait: waitFlag, propagate: true, parameters: params
+      build job: jobName, wait: waitFlag, propagate: true, parameters: p
       echo "[${tokenId}] ✔ DONE ${jobItem.name}"
     } catch (e) {
       ok = false
@@ -123,72 +101,128 @@ def workerLoop(String tokenId, int maxIdleRounds) {
       echo "[${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
     }
 
-    // ---- Finalize outcome (under lock) ----
-    withStashedQueue {
-      def qText2 = fileExists('queue.json') ? readFile('queue.json') : '{"jobs":[],"deadLetter":[]}'
-      def q2 = parsePlainSafe(qText2) ?: [jobs: [], deadLetter: []]
-      if (!(q2.jobs instanceof List)) q2.jobs = []
-      if (!(q2.deadLetter instanceof List)) q2.deadLetter = []
+    finalizeOne(jobItem, ok, errMsg, tokenId)  // finalize atomically on QUEUE_NODE
+  }
+}
 
-      // Find the running record we claimed
-      int idx2 = q2.jobs.findIndexOf {
-        it.name?.toString()   == jobItem.name?.toString() &&
-        (it.receivedAt ?: '') == (jobItem.receivedAt ?: '') &&
-        (it.processor ?: '')  == tokenId &&
-        (it.status ?: '')     == 'running'
+/* ===================== Central queue helpers (no plugins) ===================== */
+
+def withCentralQueue(Closure body) {
+  node(QUEUE_NODE) {
+    dir(QUEUE_DIR) {
+      // ensure dir + file
+      if (!fileExists(QUEUE_FILE)) {
+        writeFile file: QUEUE_FILE, text: '{"jobs":[],"deadLetter":[]}'
       }
+      withFsMutex {
+        body.call()
+      }
+    }
+  }
+}
 
-      if (idx2 == -1) {
-        echo "[${tokenId}] WARN: Claimed item not found during finalize; best-effort write."
-        if (!ok) { (q2.deadLetter as List) << (jobItem + [status: 'failed', error: (errMsg ?: 'unknown')]) }
+def claimOne(String tokenId) {
+  def claimed = null
+  withCentralQueue {
+    def qText = readFile(QUEUE_FILE)
+    def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
+    if (!(q.jobs instanceof List)) q.jobs = []
+    if (!(q.deadLetter instanceof List)) q.deadLetter = []
+
+    // Priority desc, FIFO by receivedAt
+    q.jobs.sort { a, b ->
+      int pa = (a.priority ?: 0) as int
+      int pb = (b.priority ?: 0) as int
+      def byPrio = (pb <=> pa)
+      if (byPrio != 0) return byPrio
+      (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
+    }
+
+    int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
+    if (idx != -1) {
+      claimed = q.jobs[idx]
+      claimed.status    = 'running'
+      claimed.processor = tokenId
+      claimed.attempts  = ((claimed.attempts ?: 0) as int) + 1
+      writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs:q.jobs, deadLetter:q.deadLetter]))
+    }
+  }
+  return claimed
+}
+
+def finalizeOne(def jobItem, boolean ok, String errMsg, String tokenId) {
+  withCentralQueue {
+    def qText = readFile(QUEUE_FILE)
+    def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
+    if (!(q.jobs instanceof List)) q.jobs = []
+    if (!(q.deadLetter instanceof List)) q.deadLetter = []
+
+    int idx2 = q.jobs.findIndexOf {
+      it.name?.toString()   == jobItem.name?.toString() &&
+      (it.receivedAt ?: '') == (jobItem.receivedAt ?: '') &&
+      (it.processor ?: '')  == tokenId &&
+      (it.status ?: '')     == 'running'
+    }
+
+    if (idx2 == -1) {
+      echo "[${tokenId}] WARN: Claimed item not found during finalize."
+      if (!ok) { (q.deadLetter as List) << (jobItem + [status:'failed', error:(errMsg ?: 'unknown')]) }
+    } else {
+      def running = q.jobs.remove(idx2)
+      if (ok) {
+        // success: drop
       } else {
-        def running = q2.jobs.remove(idx2)
-        if (ok) {
-          // success => drop
+        int attempts = (running.attempts ?: 1) as int
+        if (attempts >= 3) {
+          running.status = 'failed'
+          running.error  = errMsg
+          (q.deadLetter as List) << running
         } else {
-          int attempts = (running.attempts ?: 1) as int
-          if (attempts >= 3) {
-            running.status = 'failed'
-            running.error  = errMsg
-            (q2.deadLetter as List) << running
-          } else {
-            // Requeue fairly: reset status/processor; keep original receivedAt so FIFO within priority is preserved
-            running.status    = 'queued'
-            running.processor = null
-            q2.jobs << running
-          }
+          running.status    = 'queued'
+          running.processor = null
+          q.jobs << running   // requeue; fairness kept by resort during next claim
         }
       }
+    }
 
-      writeFile file: 'queue.json', text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs: q2.jobs, deadLetter: q2.deadLetter]))
+    writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs:q.jobs, deadLetter:q.deadLetter]))
+  }
+}
+
+/* ============================ Filesystem mutex ============================ */
+
+def withFsMutex(Closure body) {
+  // Simple mkdir-based mutex that works on the central node
+  int attempts = 0
+  int maxAttempts = 120
+  int sleepSec = 1
+
+  try {
+    while (true) {
+      int code = isUnix()
+        ? sh(script: "mkdir '${LOCK_DIR}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
+        : powershell(returnStatus: true, script: """
+            try { New-Item -ItemType Directory -Path '${LOCK_DIR}' -ErrorAction Stop | Out-Null; exit 0 }
+            catch { exit 1 }
+          """.stripIndent())
+      if (code == 0) break
+      attempts++
+      if (attempts >= maxAttempts) error "Could not acquire queue mutex at ${pwd()}/${LOCK_DIR}"
+      sleep time: sleepSec, unit: 'SECONDS'
+    }
+
+    body.call()
+
+  } finally {
+    if (isUnix()) {
+      sh script: "rm -rf '${LOCK_DIR}' || true"
+    } else {
+      powershell script: "Remove-Item -LiteralPath '${LOCK_DIR}' -Force -Recurse -ErrorAction SilentlyContinue"
     }
   }
 }
 
-/* ============================ Shared Queue Helpers ============================ */
-/*
-  Uses a single stash name ('queue-json') guarded by a Jenkins lock.
-  Any code inside withStashedQueue must read/modify/write 'queue.json' in CWD.
-*/
-def withStashedQueue(Closure body) {
-  lock(resource: 'queue-json-lock') {
-    // Pull latest queue.json into this workspace
-    try { unstash name: 'queue-json' } catch (ignored) { /* first run, nothing stashed yet */ }
-
-    if (!fileExists('queue.json')) {
-      writeFile file: 'queue.json', text: '{"jobs":[],"deadLetter":[]}'
-    }
-
-    try {
-      body.call()
-    } finally {
-      // Push updated queue.json back to the controller
-      stash name: 'queue-json', includes: 'queue.json'
-    }
-  }
-}
-
-/* ============================ JSON & Param Helpers ============================ */
+/* ============================ JSON & Params ============================ */
 
 def buildParams(List plist) {
   def m = [:]
