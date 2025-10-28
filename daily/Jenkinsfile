@@ -73,6 +73,7 @@ pipeline {
             }
           } else {
             //def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
+            echo "running the first else block just testing: ...."
             for (job in allJobs) {
               echo "Checking job: ${job.name.toString()}"
               if (job.name.toString() == params.JOB_TO_RUN) {
