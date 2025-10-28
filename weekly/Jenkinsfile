@@ -1,7 +1,7 @@
 pipeline {
   agent any
   options { timestamps() }
-  triggers { cron('H H * * 1') } // weekly (Mon). Adjust as needed.
+  //triggers { cron('H H * * 1') } // weekly (Mon). Adjust as needed.
 
   stages {
     stage('Send to queue') {

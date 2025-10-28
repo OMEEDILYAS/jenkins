@@ -1,7 +1,7 @@
 pipeline {
   agent any
   options { timestamps() }
-  triggers { cron('H/1 * * * *') } // hourly
+  //triggers { cron('H/1 * * * *') } // hourly
 
   stages {
     stage('Send to queue') {
