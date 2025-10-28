@@ -10,7 +10,7 @@
         { "name": "PARAM1", "value": "alpha" },
         { "name": "PARAM2", "value": "beta" },
         { "name": "PARAM3", "value": "gamma" },
-        { "name": "PARAM4", "value": "delta" }
+        { "name": "env", "value": "live" }
       ]
     },
     {
@@ -23,7 +23,7 @@
         { "name": "PARAM1", "value": "x" },
         { "name": "PARAM2", "value": "y" },
         { "name": "PARAM3", "value": "z" },
-        { "name": "PARAM4", "value": "v" }
+        { "name": "env", "value": "live" }
       ]
     },
     {
@@ -36,7 +36,7 @@
         { "name": "PARAM1", "value": "red" },
         { "name": "PARAM2", "value": "blue" },
         { "name": "PARAM3", "value": "green" },
-        { "name": "PARAM4", "value": "yellow" }
+        { "name": "env", "value": "live" }
       ]
     },
     {
@@ -49,7 +49,7 @@
         { "name": "PARAM1", "value": "one" },
         { "name": "PARAM2", "value": "two" },
         { "name": "PARAM3", "value": "three" },
-        { "name": "PARAM4", "value": "four" }
+        { "name": "env", "value": "live" }
       ]
     },
     {
@@ -62,7 +62,7 @@
         { "name": "PARAM1", "value": "spring" },
         { "name": "PARAM2", "value": "summer" },
         { "name": "PARAM3", "value": "autumn" },
-        { "name": "PARAM4", "value": "winter" }
+        { "name": "env", "value": "live" }
       ]
     }
   ]

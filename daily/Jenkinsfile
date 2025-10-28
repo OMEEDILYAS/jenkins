@@ -1,23 +1,108 @@
 pipeline {
-  agent any
-  options { timestamps() }
-  //triggers { cron('H/3 * * * *') } // daily
-
+  agent { label 'master' }
+  parameters {
+    choice (choices: ['all','one','two','three','four','five'], description: 'Select job to run or all to run all jobs', name: 'JOB_TO_RUN')
+    choice (choices: ['live', 'staging'], description: 'Select environment to run jobs in', name: 'ENV_TO_RUN')
+  }
+  options {
+    // keep 15 builds for 30 days
+    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
+    timestamps()
+  }
+  // triggers implement later
+  environment {
+    BUILD_BY = "${currentBuild.getBuildCauses()}"
+  }
   stages {
-    stage('Send to queue') {
+    stage('send all jobs to queue') {
+      when {
+        expression { BUILD_BY == 'null' }
+      }
       steps {
         script {
           def jsonText = readFile('daily/daily.json')
-          echo "Sending ${jsonText.length()} bytes from daily.json to queue"
+          echo "Sending over to queue: ${jsonText}"
           build job: 'optimized/queue',
                 wait: false,
                 propagate: false,
                 parameters: [
-                  string(name: 'BATCH_JSON', value: jsonText),
-                  string(name: 'SOURCE',     value: 'daily')
+                  string(name: 'Json_jobs', value: jsonText),
+                  string(name: 'Env_TO_RUN', value: "${params.ENV_TO_RUN}"),
                 ]
         }
       }
+    }
+    stage('triggered by user') {
+      when {
+        expression { BUILD_BY != 'null' }
+      }
+      steps {
+        script {
+          def jsonText = readFile('daily/daily.json')
+          def allJobs = readJSON text: jsonText
+          def selectedJobs = []
+
+          if (params.JOB_TO_RUN == 'all') {
+            selectedJobs = allJobs
+            if (params.ENV_TO_RUN == 'live') {
+              echo "Running all jobs in live environment"
+              for (job in selectedJobs) {
+                job.priority = 12
+              }
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: "selectedJobs"),
+                ]
+              )
+            } else {
+              echo "Running all jobs in staging environment"
+              for (job in selectedJobs) {
+                job.priority = 4
+                job.parameters.find { it.name == 'env' }.value = 'staging'
+              }
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: "selectedJobs"),
+                ]
+              )
+            }
+          } else {
+            def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
+            if (params.ENV_TO_RUN == 'live') {
+              echo "Running job ${params.JOB_TO_RUN} in live environment"
+              selectedJob.priority = 14
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: "[selectedJob]"),
+                ]
+              )
+            } else {
+              echo "Running job ${params.JOB_TO_RUN} in staging environment"
+              selectedJob.priority = 6
+              selectedJob.parameters.find { it.name == 'env' }.value = 'staging'
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: "[selectedJob]"),
+                ]
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  post{
+    always {
+      echo "Daily Jenkinsfile execution completed."
+      cleanupWs()
     }
   }
 }
