@@ -1,3 +1,4 @@
+// Jenkinsfile — Option B: shared queue via stash/unstash + improvements
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
@@ -5,6 +6,7 @@ pipeline {
   parameters {
     string(name: 'BATCH_JSON', defaultValue: '', description: 'Raw JSON payload from a scheduler (jobs array).')
     string(name: 'SOURCE',     defaultValue: '', description: 'every_15m | hourly | daily | weekly')
+    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'How many 5s idle checks before a worker leg exits (default ~2min).')
   }
 
   stages {
@@ -14,42 +16,39 @@ pipeline {
         script {
           echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
 
-          def queuePath = 'queue/queue.json'
-          def existingText = fileExists(queuePath) ? readFile(queuePath) : ''
-          if (!existingText?.trim()) {
-            echo "Queue file missing/blank. Initializing to {\"jobs\":[], \"deadLetter\":[]}"
-            existingText = '{"jobs":[], "deadLetter":[]}'
+          withStashedQueue {
+            // Load or init
+            def qText = fileExists('queue.json') ? readFile('queue.json') : ''
+            if (!qText?.trim()) {
+              qText = '{"jobs":[],"deadLetter":[]}'
+            }
+
+            // Merge new jobs
+            def merged = safeMerge(qText, params.BATCH_JSON, params.SOURCE)
+            def pretty = groovy.json.JsonOutput.prettyPrint(merged)
+
+            writeFile file: 'queue.json', text: pretty
           }
 
-          withQueueLock {
-            def curText = fileExists(queuePath) ? readFile(queuePath) : existingText
-            if (!curText?.trim()) curText = existingText
-
-            def mergedJson = safeMerge(curText, params.BATCH_JSON, params.SOURCE)
-            def pretty = groovy.json.JsonOutput.prettyPrint(mergedJson)
-            writeFile file: queuePath, text: pretty
-            echo "Queue updated at ${queuePath}"
-          }
+          echo "Queue updated."
         }
       }
     }
 
-    /* ====================== MATRIX: one worker per agent ====================== */
     stage('Process queue (tokens)') {
       matrix {
         axes {
           axis {
             name 'TOKEN'
-            values 'agent-1','agent-2','agent-3','agent-4'   // <--- your agents
+            values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
           }
         }
-        // Run each matrix leg on its matching agent label
         agent { label "${TOKEN}" }
 
         stages {
           stage('Worker loop') {
             steps {
-              script { workerLoop(env.TOKEN as String) }
+              script { workerLoop(env.TOKEN as String, (params.IDLE_ROUNDS ?: '24') as int) }
             }
           }
         }
@@ -60,24 +59,20 @@ pipeline {
 
 /* ============================ Worker Logic ============================ */
 
-def workerLoop(String tokenId) {
-  def queuePath = 'queue/queue.json'
+def workerLoop(String tokenId, int maxIdleRounds) {
   int idleRounds = 0
-  int maxIdleRounds = 3  // stop after a few idle checks with no work
 
   while (true) {
     def jobItem = null
 
-    withQueueLock {
-      if (!fileExists(queuePath)) return
-      def qText = readFile(queuePath)
-      if (!qText?.trim()) return
-
+    // -------- Claim a job (under lock; queue materialized via unstash) --------
+    withStashedQueue {
+      def qText = fileExists('queue.json') ? readFile('queue.json') : '{"jobs":[],"deadLetter":[]}'
       def q = parsePlainSafe(qText) ?: [jobs: [], deadLetter: []]
       if (!(q.jobs instanceof List)) q.jobs = []
       if (!(q.deadLetter instanceof List)) q.deadLetter = []
 
-      // Highest priority first; FIFO within same priority
+      // Highest priority first; FIFO by receivedAt within same priority
       q.jobs.sort { a, b ->
         int pa = (a.priority ?: 0) as int
         int pb = (b.priority ?: 0) as int
@@ -86,25 +81,22 @@ def workerLoop(String tokenId) {
         (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
       }
 
-      // pick first non-running
+      // Find first non-running job
       int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
-      if (idx == -1) {
-        jobItem = null
-      } else {
+      if (idx != -1) {
         jobItem = q.jobs[idx]
         jobItem.status    = 'running'
         jobItem.processor = tokenId
         jobItem.attempts  = ((jobItem.attempts ?: 0) as int) + 1
-
-        def newText = toJsonString([jobs: q.jobs, deadLetter: q.deadLetter])
-        writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newText)
+        // Persist claim
+        writeFile file: 'queue.json', text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs: q.jobs, deadLetter: q.deadLetter]))
       }
-    } // lock released
+    } // lock releases here
 
     if (jobItem == null) {
       idleRounds++
-      if (idleRounds >= maxIdleRounds) {
-        echo "[${tokenId}] No jobs available. Exiting."
+      if (idleRounds >= Math.max(1, maxIdleRounds)) {
+        echo "[${tokenId}] No jobs available after ${idleRounds} checks. Exiting."
         break
       }
       sleep time: 5, unit: 'SECONDS'
@@ -114,11 +106,11 @@ def workerLoop(String tokenId) {
     idleRounds = 0 // got work
 
     // ---- Execute outside the lock ----
-    def jobName  = jobItem.job.toString()
+    def jobName  = jobItem.job?.toString()
     def waitFlag = !!jobItem.wait
     def params   = buildParams(jobItem.parameters)
 
-    echo "[${tokenId}] ▶ RUN ${jobItem.name} from ${jobItem.source} -> ${jobName} (priority=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
+    echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
 
     boolean ok = true
     String errMsg = null
@@ -131,28 +123,28 @@ def workerLoop(String tokenId) {
       echo "[${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
     }
 
-    // ---- Persist outcome ----
-    withQueueLock {
-      def qText2 = fileExists(queuePath) ? readFile(queuePath) : '{"jobs":[], "deadLetter":[]}'
+    // ---- Finalize outcome (under lock) ----
+    withStashedQueue {
+      def qText2 = fileExists('queue.json') ? readFile('queue.json') : '{"jobs":[],"deadLetter":[]}'
       def q2 = parsePlainSafe(qText2) ?: [jobs: [], deadLetter: []]
       if (!(q2.jobs instanceof List)) q2.jobs = []
       if (!(q2.deadLetter instanceof List)) q2.deadLetter = []
 
+      // Find the running record we claimed
       int idx2 = q2.jobs.findIndexOf {
-        it.name?.toString()      == jobItem.name?.toString() &&
-        (it.receivedAt ?: '')    == (jobItem.receivedAt ?: '') &&
-        (it.processor ?: '')     == tokenId &&
-        (it.status ?: '')        == 'running'
+        it.name?.toString()   == jobItem.name?.toString() &&
+        (it.receivedAt ?: '') == (jobItem.receivedAt ?: '') &&
+        (it.processor ?: '')  == tokenId &&
+        (it.status ?: '')     == 'running'
       }
 
       if (idx2 == -1) {
-        echo "[${tokenId}] WARN: Claimed item not found during finalize; writing best-effort state."
-        if (!ok) { (q2.deadLetter as List) << (jobItem + [error: (errMsg ?: 'unknown')]) }
+        echo "[${tokenId}] WARN: Claimed item not found during finalize; best-effort write."
+        if (!ok) { (q2.deadLetter as List) << (jobItem + [status: 'failed', error: (errMsg ?: 'unknown')]) }
       } else {
         def running = q2.jobs.remove(idx2)
-
         if (ok) {
-          // success => removed
+          // success => drop
         } else {
           int attempts = (running.attempts ?: 1) as int
           if (attempts >= 3) {
@@ -160,6 +152,7 @@ def workerLoop(String tokenId) {
             running.error  = errMsg
             (q2.deadLetter as List) << running
           } else {
+            // Requeue fairly: reset status/processor; keep original receivedAt so FIFO within priority is preserved
             running.status    = 'queued'
             running.processor = null
             q2.jobs << running
@@ -167,49 +160,35 @@ def workerLoop(String tokenId) {
         }
       }
 
-      def newText2 = toJsonString([jobs: q2.jobs, deadLetter: q2.deadLetter])
-      writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newText2)
+      writeFile file: 'queue.json', text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs: q2.jobs, deadLetter: q2.deadLetter]))
     }
   }
 }
 
-/* ============================ Cross-platform Lock ============================ */
+/* ============================ Shared Queue Helpers ============================ */
+/*
+  Uses a single stash name ('queue-json') guarded by a Jenkins lock.
+  Any code inside withStashedQueue must read/modify/write 'queue.json' in CWD.
+*/
+def withStashedQueue(Closure body) {
+  lock(resource: 'queue-json-lock') {
+    // Pull latest queue.json into this workspace
+    try { unstash name: 'queue-json' } catch (ignored) { /* first run, nothing stashed yet */ }
 
-def withQueueLock(Closure body) {
-  def lockDir = "${pwd()}/queue/.lock"
-  lockDir = lockDir.replace('\\','/')
-
-  int attempts = 0
-  int maxAttempts = 120
-
-  while (true) {
-    int code
-    if (isUnix()) {
-      code = sh(script: "mkdir '${lockDir}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
-    } else {
-      code = powershell(returnStatus: true, script: """
-        try { New-Item -ItemType Directory -Path '${lockDir}' -ErrorAction Stop | Out-Null; exit 0 }
-        catch { exit 1 }
-      """.stripIndent())
+    if (!fileExists('queue.json')) {
+      writeFile file: 'queue.json', text: '{"jobs":[],"deadLetter":[]}'
     }
-    if (code == 0) break
-    attempts++
-    if (attempts >= maxAttempts) { error "Could not acquire queue lock at ${lockDir}" }
-    sleep time: 1, unit: 'SECONDS'
-  }
 
-  try {
-    body.call()
-  } finally {
-    if (isUnix()) {
-      sh     script: "rm -rf '${lockDir}' || true"
-    } else {
-      powershell script: "Remove-Item -LiteralPath '${lockDir}' -Force -Recurse -ErrorAction SilentlyContinue"
+    try {
+      body.call()
+    } finally {
+      // Push updated queue.json back to the controller
+      stash name: 'queue-json', includes: 'queue.json'
     }
   }
 }
 
-/* ============================ JSON Helpers ============================ */
+/* ============================ JSON & Param Helpers ============================ */
 
 def buildParams(List plist) {
   def m = [:]
