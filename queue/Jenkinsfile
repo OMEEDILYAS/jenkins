@@ -1,4 +1,8 @@
-// Jenkinsfile — Centralized JSON queue (no plugins) + dispatcher matrix off workers (async builds)
+// Jenkinsfile (Dispatcher)
+// Centralized JSON queue on controller ("built-in"), no extra plugins.
+// Matrix legs run on built-in (NOT on workers).
+// Each token dispatches to its OWN worker by passing NODE_LABEL=tokenId.
+// Downstream builds are async to avoid single-executor deadlocks.
 
 pipeline {
   agent any
@@ -7,7 +11,7 @@ pipeline {
   // ---- Tune these to your setup ----
   environment {
     // Where the shared queue lives and where the dispatcher runs:
-    // Use 'built-in' for controller; if your controller label is 'master', change both below to 'master'.
+    // If your controller label is 'master', change both to 'master'.
     QUEUE_NODE     = 'built-in'
     DISPATCH_LABEL = 'built-in'
 
@@ -45,7 +49,7 @@ pipeline {
         axes {
           axis {
             name 'TOKEN'
-            // Logical tokens (do NOT pin the dispatcher to workers)
+            // Logical tokens (do NOT run on the workers)
             values 'agent-1','agent-2','agent-3','agent-4'
           }
         }
@@ -91,11 +95,15 @@ def workerLoop(String tokenId, int maxIdleRounds) {
     def jobName  = jobItem.job?.toString()
     def params   = buildParams(jobItem.parameters)
 
-    // Always async to avoid deadlocks when workers have 1 executor
-    echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts})"
+    // Route this job to the exact worker for this token:
+    params += [ string(name: 'NODE_LABEL', value: tokenId) ]
+
+    echo "[${tokenId}] ▶ DISPATCH ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts})"
+
     boolean ok = true
     String errMsg = null
     try {
+      // Always async to avoid deadlocks on single-executor workers
       build job: jobName, wait: false, propagate: true, parameters: params
       echo "[${tokenId}] ✔ DISPATCHED ${jobItem.name}"
     } catch (e) {
