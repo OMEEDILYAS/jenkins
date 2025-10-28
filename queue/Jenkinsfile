@@ -1,40 +1,41 @@
-/*
-  Queue is centralized on one node (usually the controller/built-in),
-  and all reads/writes happen there under a simple filesystem mutex.
-  No Lockable Resources plugin needed.
-
-  Setup:
-    1) Make sure the QUEUE_NODE exists (built-in is fine).
-    2) Ensure QUEUE_DIR exists or let this job create it (it writes there).
-*/
-
-def QUEUE_NODE = 'built-in'                 // or label of a dedicated fileshare node
-def QUEUE_DIR  = 'queue-shared'             // folder under that node's workspace
-def QUEUE_FILE = 'queue.json'
-def LOCK_DIR   = '.lock'                    // fs mutex dir inside QUEUE_DIR
+// Jenkinsfile — Centralized JSON queue (no plugins) + dispatcher matrix off workers (async builds)
 
 pipeline {
   agent any
   options { timestamps(); disableConcurrentBuilds() }
 
+  // ---- Tune these to your setup ----
+  environment {
+    // Where the shared queue lives and where the dispatcher runs:
+    // Use 'built-in' for controller; if your controller label is 'master', change both below to 'master'.
+    QUEUE_NODE     = 'built-in'
+    DISPATCH_LABEL = 'built-in'
+
+    // Folder & file for queue storage on QUEUE_NODE's workspace (this job's workspace on that node)
+    QUEUE_DIR  = 'queue-shared'
+    QUEUE_FILE = 'queue.json'
+    LOCK_DIR   = '.lock' // simple mkdir-based mutex inside QUEUE_DIR
+  }
+
   parameters {
-    string(name: 'BATCH_JSON',  defaultValue: '', description: 'Raw JSON payload from scheduler (jobs array).')
+    string(name: 'BATCH_JSON',  defaultValue: '', description: 'Raw JSON payload from scheduler (e.g., {"jobs":[...]}).')
     string(name: 'SOURCE',      defaultValue: '', description: 'every_15m | hourly | daily | weekly')
-    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'How many 5s idle checks before a worker leg exits.')
+    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'Worker idle checks (5s each) before exit; 24 ≈ 2 min.')
   }
 
   stages {
+
     stage('Ingest batch') {
       when { expression { return params.BATCH_JSON?.trim() } }
       steps {
         script {
           echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
           withCentralQueue {
-            def qText = fileExists(QUEUE_FILE) ? readFile(QUEUE_FILE) : '{"jobs":[],"deadLetter":[]}'
+            def qText = fileExists(env.QUEUE_FILE) ? readFile(env.QUEUE_FILE) : '{"jobs":[],"deadLetter":[]}'
             def merged = safeMerge(qText, params.BATCH_JSON, params.SOURCE)
-            writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(merged)
+            writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(merged)
           }
-          echo "Queue updated."
+          echo "Queue updated at ${env.QUEUE_NODE}:${env.QUEUE_DIR}/${env.QUEUE_FILE}"
         }
       }
     }
@@ -44,10 +45,13 @@ pipeline {
         axes {
           axis {
             name 'TOKEN'
+            // Logical tokens (do NOT pin the dispatcher to workers)
             values 'agent-1','agent-2','agent-3','agent-4'
           }
         }
-        agent { label "${TOKEN}" }
+
+        // Run the dispatcher legs on a lightweight node (not your 4 workers)
+        agent { label env.DISPATCH_LABEL }
 
         stages {
           stage('Worker loop') {
@@ -69,7 +73,7 @@ def workerLoop(String tokenId, int maxIdleRounds) {
   int idleRounds = 0
 
   while (true) {
-    def jobItem = claimOne(tokenId)   // claim atomically on QUEUE_NODE
+    def jobItem = claimOne(tokenId)   // atomic claim on QUEUE_NODE
 
     if (jobItem == null) {
       idleRounds++
@@ -85,34 +89,32 @@ def workerLoop(String tokenId, int maxIdleRounds) {
 
     // ---- Execute outside queue critical section ----
     def jobName  = jobItem.job?.toString()
-    def waitFlag = false
-    def p        = buildParams(jobItem.parameters)
+    def params   = buildParams(jobItem.parameters)
 
-    echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
-
+    // Always async to avoid deadlocks when workers have 1 executor
+    echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts})"
     boolean ok = true
     String errMsg = null
     try {
-      build job: jobName, wait: waitFlag, propagate: true, parameters: p
-      echo "[${tokenId}] ✔ DONE ${jobItem.name}"
+      build job: jobName, wait: false, propagate: true, parameters: params
+      echo "[${tokenId}] ✔ DISPATCHED ${jobItem.name}"
     } catch (e) {
       ok = false
       errMsg = e.getMessage()
-      echo "[${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
+      echo "[${tokenId}] ✖ DISPATCH FAIL ${jobItem.name} : ${errMsg}"
     }
 
-    finalizeOne(jobItem, ok, errMsg, tokenId)  // finalize atomically on QUEUE_NODE
+    finalizeOne(jobItem, ok, errMsg, tokenId)  // atomic finalize on QUEUE_NODE
   }
 }
 
 /* ===================== Central queue helpers (no plugins) ===================== */
 
 def withCentralQueue(Closure body) {
-  node(QUEUE_NODE) {
-    dir(QUEUE_DIR) {
-      // ensure dir + file
-      if (!fileExists(QUEUE_FILE)) {
-        writeFile file: QUEUE_FILE, text: '{"jobs":[],"deadLetter":[]}'
+  node(env.QUEUE_NODE) {
+    dir(env.QUEUE_DIR) {
+      if (!fileExists(env.QUEUE_FILE)) {
+        writeFile file: env.QUEUE_FILE, text: '{"jobs":[],"deadLetter":[]}'
       }
       withFsMutex {
         body.call()
@@ -124,7 +126,7 @@ def withCentralQueue(Closure body) {
 def claimOne(String tokenId) {
   def claimed = null
   withCentralQueue {
-    def qText = readFile(QUEUE_FILE)
+    def qText = readFile(env.QUEUE_FILE)
     def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
     if (!(q.jobs instanceof List)) q.jobs = []
     if (!(q.deadLetter instanceof List)) q.deadLetter = []
@@ -144,7 +146,9 @@ def claimOne(String tokenId) {
       claimed.status    = 'running'
       claimed.processor = tokenId
       claimed.attempts  = ((claimed.attempts ?: 0) as int) + 1
-      writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs:q.jobs, deadLetter:q.deadLetter]))
+      writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(
+        toJsonString([jobs:q.jobs, deadLetter:q.deadLetter])
+      )
     }
   }
   return claimed
@@ -152,7 +156,7 @@ def claimOne(String tokenId) {
 
 def finalizeOne(def jobItem, boolean ok, String errMsg, String tokenId) {
   withCentralQueue {
-    def qText = readFile(QUEUE_FILE)
+    def qText = readFile(env.QUEUE_FILE)
     def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
     if (!(q.jobs instanceof List)) q.jobs = []
     if (!(q.deadLetter instanceof List)) q.deadLetter = []
@@ -185,39 +189,34 @@ def finalizeOne(def jobItem, boolean ok, String errMsg, String tokenId) {
       }
     }
 
-    writeFile file: QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(toJsonString([jobs:q.jobs, deadLetter:q.deadLetter]))
+    writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(
+      toJsonString([jobs:q.jobs, deadLetter:q.deadLetter])
+    )
   }
 }
 
 /* ============================ Filesystem mutex ============================ */
 
 def withFsMutex(Closure body) {
-  // Simple mkdir-based mutex that works on the central node
-  int attempts = 0
-  int maxAttempts = 120
-  int sleepSec = 1
-
+  int attempts = 0, maxAttempts = 120
   try {
     while (true) {
       int code = isUnix()
-        ? sh(script: "mkdir '${LOCK_DIR}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
+        ? sh(script: "mkdir '${env.LOCK_DIR}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
         : powershell(returnStatus: true, script: """
-            try { New-Item -ItemType Directory -Path '${LOCK_DIR}' -ErrorAction Stop | Out-Null; exit 0 }
+            try { New-Item -ItemType Directory -Path '${env.LOCK_DIR}' -ErrorAction Stop | Out-Null; exit 0 }
             catch { exit 1 }
           """.stripIndent())
       if (code == 0) break
-      attempts++
-      if (attempts >= maxAttempts) error "Could not acquire queue mutex at ${pwd()}/${LOCK_DIR}"
-      sleep time: sleepSec, unit: 'SECONDS'
+      if (++attempts >= maxAttempts) error "Could not acquire queue mutex at ${pwd()}/${env.LOCK_DIR}"
+      sleep time: 1, unit: 'SECONDS'
     }
-
     body.call()
-
   } finally {
     if (isUnix()) {
-      sh script: "rm -rf '${LOCK_DIR}' || true"
+      sh script: "rm -rf '${env.LOCK_DIR}' || true"
     } else {
-      powershell script: "Remove-Item -LiteralPath '${LOCK_DIR}' -Force -Recurse -ErrorAction SilentlyContinue"
+      powershell script: "Remove-Item -LiteralPath '${env.LOCK_DIR}' -Force -Recurse -ErrorAction SilentlyContinue"
     }
   }
 }
