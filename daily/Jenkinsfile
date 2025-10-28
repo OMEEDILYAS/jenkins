@@ -39,7 +39,8 @@ pipeline {
       steps {
         script {
           def jsonText = readFile('daily/daily.json')
-          def allJobs = readJSON text: jsonText
+          // use jsonslurper to parse jsontext here
+          def allJobs = jsonText
           def selectedJobs = []
 
           if (params.JOB_TO_RUN == 'all') {
