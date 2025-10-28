@@ -85,7 +85,7 @@ def workerLoop(String tokenId, int maxIdleRounds) {
 
     // ---- Execute outside queue critical section ----
     def jobName  = jobItem.job?.toString()
-    def waitFlag = !!jobItem.wait
+    def waitFlag = false
     def p        = buildParams(jobItem.parameters)
 
     echo "[${tokenId}] ▶ RUN ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
