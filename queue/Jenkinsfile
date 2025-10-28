@@ -8,7 +8,6 @@ pipeline {
   }
 
   stages {
-
     stage('Ingest batch') {
       when { expression { return params.BATCH_JSON?.trim() } }
       steps {
@@ -35,28 +34,18 @@ pipeline {
       }
     }
 
-    /* ==========================================================
-     * SINGLE WORKER PROCESSOR
-     * When you’re ready to add tokens (parallel processors),
-     * REPLACE this stage with the commented matrix block below.
-     * ========================================================== */
-    stage('Process queue (single worker)') {
-      steps {
-        script {
-          workerLoop('1') // TOKEN = "1" for single processor
-        }
-      }
-    }
-
-    /* ===================== LATER: MATRIX VERSION =====================
+    /* ====================== MATRIX: one worker per agent ====================== */
     stage('Process queue (tokens)') {
       matrix {
         axes {
           axis {
             name 'TOKEN'
-            values '1','2','3','4'  // <--- add/remove tokens here later
+            values 'agent-1','agent-2','agent-3','agent-4'   // <--- your agents
           }
         }
+        // Run each matrix leg on its matching agent label
+        agent { label "${TOKEN}" }
+
         stages {
           stage('Worker loop') {
             steps {
@@ -66,7 +55,6 @@ pipeline {
         }
       }
     }
-    =================================================================== */
   }
 }
 
@@ -75,7 +63,7 @@ pipeline {
 def workerLoop(String tokenId) {
   def queuePath = 'queue/queue.json'
   int idleRounds = 0
-  int maxIdleRounds = 3  // stop after a few idle checks
+  int maxIdleRounds = 3  // stop after a few idle checks with no work
 
   while (true) {
     def jobItem = null
@@ -89,7 +77,7 @@ def workerLoop(String tokenId) {
       if (!(q.jobs instanceof List)) q.jobs = []
       if (!(q.deadLetter instanceof List)) q.deadLetter = []
 
-      // sort by priority DESC then FIFO by receivedAt
+      // Highest priority first; FIFO within same priority
       q.jobs.sort { a, b ->
         int pa = (a.priority ?: 0) as int
         int pb = (b.priority ?: 0) as int
@@ -98,18 +86,16 @@ def workerLoop(String tokenId) {
         (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
       }
 
-      // find first not running (status null or 'queued')
+      // pick first non-running
       int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
       if (idx == -1) {
         jobItem = null
       } else {
-        // claim it
         jobItem = q.jobs[idx]
         jobItem.status    = 'running'
         jobItem.processor = tokenId
         jobItem.attempts  = ((jobItem.attempts ?: 0) as int) + 1
 
-        // write back with job marked running so no other worker can grab it
         def newText = toJsonString([jobs: q.jobs, deadLetter: q.deadLetter])
         writeFile file: queuePath, text: groovy.json.JsonOutput.prettyPrint(newText)
       }
@@ -118,31 +104,31 @@ def workerLoop(String tokenId) {
     if (jobItem == null) {
       idleRounds++
       if (idleRounds >= maxIdleRounds) {
-        echo "[TOKEN ${tokenId}] No jobs available. Exiting."
+        echo "[${tokenId}] No jobs available. Exiting."
         break
       }
       sleep time: 5, unit: 'SECONDS'
       continue
     }
 
-    idleRounds = 0 // we got work
+    idleRounds = 0 // got work
 
     // ---- Execute outside the lock ----
     def jobName  = jobItem.job.toString()
     def waitFlag = !!jobItem.wait
     def params   = buildParams(jobItem.parameters)
 
-    echo "[TOKEN ${tokenId}] ▶ RUN ${jobItem.name} from ${jobItem.source} -> ${jobName} (priority=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
+    echo "[${tokenId}] ▶ RUN ${jobItem.name} from ${jobItem.source} -> ${jobName} (priority=${jobItem.priority}, attempt=${jobItem.attempts}, wait=${waitFlag})"
 
     boolean ok = true
     String errMsg = null
     try {
       build job: jobName, wait: waitFlag, propagate: true, parameters: params
-      echo "[TOKEN ${tokenId}] ✔ DONE ${jobItem.name}"
+      echo "[${tokenId}] ✔ DONE ${jobItem.name}"
     } catch (e) {
       ok = false
       errMsg = e.getMessage()
-      echo "[TOKEN ${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
+      echo "[${tokenId}] ✖ FAIL ${jobItem.name} : ${errMsg}"
     }
 
     // ---- Persist outcome ----
@@ -152,7 +138,6 @@ def workerLoop(String tokenId) {
       if (!(q2.jobs instanceof List)) q2.jobs = []
       if (!(q2.deadLetter instanceof List)) q2.deadLetter = []
 
-      // find the running item (by name + receivedAt + processor) and update/remove
       int idx2 = q2.jobs.findIndexOf {
         it.name?.toString()      == jobItem.name?.toString() &&
         (it.receivedAt ?: '')    == (jobItem.receivedAt ?: '') &&
@@ -161,17 +146,14 @@ def workerLoop(String tokenId) {
       }
 
       if (idx2 == -1) {
-        echo "[TOKEN ${tokenId}] WARN: Claimed item not found during finalize; writing best-effort state."
-        if (!ok) {
-          (q2.deadLetter as List) << (jobItem + [error: (errMsg ?: 'unknown')])
-        }
+        echo "[${tokenId}] WARN: Claimed item not found during finalize; writing best-effort state."
+        if (!ok) { (q2.deadLetter as List) << (jobItem + [error: (errMsg ?: 'unknown')]) }
       } else {
         def running = q2.jobs.remove(idx2)
 
         if (ok) {
-          // success: removed permanently
+          // success => removed
         } else {
-          // failure: retry up to 3
           int attempts = (running.attempts ?: 1) as int
           if (attempts >= 3) {
             running.status = 'failed'
@@ -191,41 +173,39 @@ def workerLoop(String tokenId) {
   }
 }
 
-/* ============================ Lock Helpers (Windows) ============================ */
+/* ============================ Cross-platform Lock ============================ */
 
 def withQueueLock(Closure body) {
   def lockDir = "${pwd()}/queue/.lock"
   lockDir = lockDir.replace('\\','/')
 
-  // Acquire
   int attempts = 0
   int maxAttempts = 120
+
   while (true) {
-    int code = powershell(returnStatus: true, script: """
-      try {
-        New-Item -ItemType Directory -Path '${lockDir}' -ErrorAction Stop | Out-Null
-        exit 0
-      } catch {
-        exit 1
-      }
-    """.stripIndent())
+    int code
+    if (isUnix()) {
+      code = sh(script: "mkdir '${lockDir}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
+    } else {
+      code = powershell(returnStatus: true, script: """
+        try { New-Item -ItemType Directory -Path '${lockDir}' -ErrorAction Stop | Out-Null; exit 0 }
+        catch { exit 1 }
+      """.stripIndent())
+    }
     if (code == 0) break
     attempts++
-    if (attempts >= maxAttempts) {
-      error "Could not acquire queue lock at ${lockDir}"
-    }
+    if (attempts >= maxAttempts) { error "Could not acquire queue lock at ${lockDir}" }
     sleep time: 1, unit: 'SECONDS'
   }
 
   try {
     body.call()
   } finally {
-    // Release
-    powershell script: """
-      try {
-        Remove-Item -LiteralPath '${lockDir}' -Force -Recurse -ErrorAction SilentlyContinue
-      } catch { }
-    """.stripIndent()
+    if (isUnix()) {
+      sh     script: "rm -rf '${lockDir}' || true"
+    } else {
+      powershell script: "Remove-Item -LiteralPath '${lockDir}' -Force -Recurse -ErrorAction SilentlyContinue"
+    }
   }
 }
 
