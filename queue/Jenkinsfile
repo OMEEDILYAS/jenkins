@@ -5,7 +5,9 @@
 // Downstream builds are async to avoid single-executor deadlocks.
 
 pipeline {
-  agent any
+  agent{
+    label 'built-in Node'
+  }
   options { timestamps(); disableConcurrentBuilds() }
 
   // ---- Tune these to your setup ----
