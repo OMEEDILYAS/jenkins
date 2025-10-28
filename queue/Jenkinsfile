@@ -1,69 +1,56 @@
-// Jenkinsfile (Dispatcher)
-// Centralized JSON queue on controller ("built-in"), no extra plugins.
-// Matrix legs run on built-in (NOT on workers).
-// Each token dispatches to its OWN worker by passing NODE_LABEL=tokenId.
-// Downstream builds are async to avoid single-executor deadlocks.
+// Jenkinsfile — controller-orchestrated matrix across 4 agents
 
 pipeline {
-  agent{
-    label 'master'
-  }
-  options { timestamps(); disableConcurrentBuilds() }
+  // Top-level agent: run orchestration on the controller (change to 'master' if your controller label is 'master')
+  agent { label 'built-in' }
 
-  // ---- Tune these to your setup ----
-  environment {
-    // Where the shared queue lives and where the dispatcher runs:
-    // If your controller label is 'master', change both to 'master'.
-    QUEUE_NODE     = 'built-in'
-    DISPATCH_LABEL = 'built-in'
-
-    // Folder & file for queue storage on QUEUE_NODE's workspace (this job's workspace on that node)
-    QUEUE_DIR  = 'queue-shared'
-    QUEUE_FILE = 'queue.json'
-    LOCK_DIR   = '.lock' // simple mkdir-based mutex inside QUEUE_DIR
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '10')) // keep only last 10 builds
   }
 
   parameters {
-    string(name: 'BATCH_JSON',  defaultValue: '', description: 'Raw JSON payload from scheduler (e.g., {"jobs":[...]}).')
-    string(name: 'SOURCE',      defaultValue: '', description: 'every_15m | hourly | daily | weekly')
-    string(name: 'IDLE_ROUNDS', defaultValue: '24', description: 'Worker idle checks (5s each) before exit; 24 ≈ 2 min.')
+    // Add/adjust as needed
+    string(name: 'PARAM1', defaultValue: '', description: 'Free-form parameter 1')
+    choice(name: 'RUN_MODE', choices: ['fast', 'normal', 'slow'], description: 'Example choice param')
+  }
+
+  // We'll populate BUILD_BY at runtime (no extra plugins required)
+  environment {
+    BUILD_BY = ''  // will be set in Init stage
   }
 
   stages {
-
-    stage('Ingest batch') {
-      when { expression { return params.BATCH_JSON?.trim() } }
+    stage('Init') {
       steps {
         script {
-          echo "Ingesting batch from source='${params.SOURCE}' (size=${params.BATCH_JSON.length()})"
-          withCentralQueue {
-            def qText = fileExists(env.QUEUE_FILE) ? readFile(env.QUEUE_FILE) : '{"jobs":[],"deadLetter":[]}'
-            def merged = safeMerge(qText, params.BATCH_JSON, params.SOURCE)
-            writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(merged)
-          }
-          echo "Queue updated at ${env.QUEUE_NODE}:${env.QUEUE_DIR}/${env.QUEUE_FILE}"
+          env.BUILD_BY = getBuildUser() ?: 'SYSTEM'
+          echo "Build triggered by: ${env.BUILD_BY}"
         }
       }
     }
 
-    stage('Process queue (tokens)') {
+    stage('workflow') {
       matrix {
         axes {
           axis {
-            name 'TOKEN'
-            // Logical tokens (do NOT run on the workers)
-            values 'agent-1','agent-2','agent-3','agent-4'
+            name 'AGENT'                // use 'AGENT' to avoid clashing with the 'agent {}' directive
+            values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
           }
         }
 
-        // Run the dispatcher legs on a lightweight node (not your 4 workers)
-        agent { label env.DISPATCH_LABEL }
-
         stages {
-          stage('Worker loop') {
+          stage('work') {
+            // Run this leg on the specific agent label
+            agent { label "${AGENT}" }
+
             steps {
               script {
-                workerLoop(env.TOKEN as String, (params.IDLE_ROUNDS ?: '24') as int)
+                echo "Leg for ${AGENT} running on node: ${env.NODE_NAME}, started by ${env.BUILD_BY}"
+                // >>> Your main work goes here:
+                // Example: doWork() encapsulates the logic you want to run on each worker
+                doWork(AGENT, params)
               }
             }
           }
@@ -71,222 +58,52 @@ pipeline {
       }
     }
   }
-}
 
-/* ============================ Worker Logic ============================ */
-
-def workerLoop(String tokenId, int maxIdleRounds) {
-  int idleRounds = 0
-
-  while (true) {
-    def jobItem = claimOne(tokenId)   // atomic claim on QUEUE_NODE
-
-    if (jobItem == null) {
-      idleRounds++
-      if (idleRounds >= Math.max(1, maxIdleRounds)) {
-        echo "[${tokenId}] No jobs after ${idleRounds} checks. Exiting."
-        break
-      }
-      sleep time: 5, unit: 'SECONDS'
-      continue
-    }
-
-    idleRounds = 0
-
-    // ---- Execute outside queue critical section ----
-    def jobName  = jobItem.job?.toString()
-    def params   = buildParams(jobItem.parameters)
-
-    // Route this job to the exact worker for this token:
-    params += [ string(name: 'NODE_LABEL', value: tokenId) ]
-
-    echo "[${tokenId}] ▶ DISPATCH ${jobItem.name} src=${jobItem.source} -> ${jobName} (prio=${jobItem.priority}, attempt=${jobItem.attempts})"
-
-    boolean ok = true
-    String errMsg = null
-    try {
-      // Always async to avoid deadlocks on single-executor workers
-      build job: jobName, wait: false, propagate: true, parameters: params
-      echo "[${tokenId}] ✔ DISPATCHED ${jobItem.name}"
-    } catch (e) {
-      ok = false
-      errMsg = e.getMessage()
-      echo "[${tokenId}] ✖ DISPATCH FAIL ${jobItem.name} : ${errMsg}"
-    }
-
-    finalizeOne(jobItem, ok, errMsg, tokenId)  // atomic finalize on QUEUE_NODE
-  }
-}
-
-/* ===================== Central queue helpers (no plugins) ===================== */
-
-def withCentralQueue(Closure body) {
-  node(env.QUEUE_NODE) {
-    dir(env.QUEUE_DIR) {
-      if (!fileExists(env.QUEUE_FILE)) {
-        writeFile file: env.QUEUE_FILE, text: '{"jobs":[],"deadLetter":[]}'
-      }
-      withFsMutex {
-        body.call()
-      }
+  post {
+    always {
+      echo "Done. Built by ${env.BUILD_BY}"
     }
   }
 }
 
-def claimOne(String tokenId) {
-  def claimed = null
-  withCentralQueue {
-    def qText = readFile(env.QUEUE_FILE)
-    def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
-    if (!(q.jobs instanceof List)) q.jobs = []
-    if (!(q.deadLetter instanceof List)) q.deadLetter = []
+/* ========================= Helper functions ========================= */
 
-    // Priority desc, FIFO by receivedAt
-    q.jobs.sort { a, b ->
-      int pa = (a.priority ?: 0) as int
-      int pb = (b.priority ?: 0) as int
-      def byPrio = (pb <=> pa)
-      if (byPrio != 0) return byPrio
-      (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
-    }
-
-    int idx = q.jobs.findIndexOf { it.status == null || it.status == 'queued' }
-    if (idx != -1) {
-      claimed = q.jobs[idx]
-      claimed.status    = 'running'
-      claimed.processor = tokenId
-      claimed.attempts  = ((claimed.attempts ?: 0) as int) + 1
-      writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(
-        toJsonString([jobs:q.jobs, deadLetter:q.deadLetter])
-      )
-    }
-  }
-  return claimed
-}
-
-def finalizeOne(def jobItem, boolean ok, String errMsg, String tokenId) {
-  withCentralQueue {
-    def qText = readFile(env.QUEUE_FILE)
-    def q = parsePlainSafe(qText) ?: [jobs:[], deadLetter:[]]
-    if (!(q.jobs instanceof List)) q.jobs = []
-    if (!(q.deadLetter instanceof List)) q.deadLetter = []
-
-    int idx2 = q.jobs.findIndexOf {
-      it.name?.toString()   == jobItem.name?.toString() &&
-      (it.receivedAt ?: '') == (jobItem.receivedAt ?: '') &&
-      (it.processor ?: '')  == tokenId &&
-      (it.status ?: '')     == 'running'
-    }
-
-    if (idx2 == -1) {
-      echo "[${tokenId}] WARN: Claimed item not found during finalize."
-      if (!ok) { (q.deadLetter as List) << (jobItem + [status:'failed', error:(errMsg ?: 'unknown')]) }
-    } else {
-      def running = q.jobs.remove(idx2)
-      if (ok) {
-        // success: drop
-      } else {
-        int attempts = (running.attempts ?: 1) as int
-        if (attempts >= 3) {
-          running.status = 'failed'
-          running.error  = errMsg
-          (q.deadLetter as List) << running
-        } else {
-          running.status    = 'queued'
-          running.processor = null
-          q.jobs << running   // requeue; fairness kept by resort during next claim
-        }
-      }
-    }
-
-    writeFile file: env.QUEUE_FILE, text: groovy.json.JsonOutput.prettyPrint(
-      toJsonString([jobs:q.jobs, deadLetter:q.deadLetter])
-    )
-  }
-}
-
-/* ============================ Filesystem mutex ============================ */
-
-def withFsMutex(Closure body) {
-  int attempts = 0, maxAttempts = 120
-  try {
-    while (true) {
-      int code = isUnix()
-        ? sh(script: "mkdir '${env.LOCK_DIR}' 2>/dev/null && exit 0 || exit 1", returnStatus: true)
-        : powershell(returnStatus: true, script: """
-            try { New-Item -ItemType Directory -Path '${env.LOCK_DIR}' -ErrorAction Stop | Out-Null; exit 0 }
-            catch { exit 1 }
-          """.stripIndent())
-      if (code == 0) break
-      if (++attempts >= maxAttempts) error "Could not acquire queue mutex at ${pwd()}/${env.LOCK_DIR}"
-      sleep time: 1, unit: 'SECONDS'
-    }
-    body.call()
-  } finally {
-    if (isUnix()) {
-      sh script: "rm -rf '${env.LOCK_DIR}' || true"
-    } else {
-      powershell script: "Remove-Item -LiteralPath '${env.LOCK_DIR}' -Force -Recurse -ErrorAction SilentlyContinue"
-    }
-  }
-}
-
-/* ============================ JSON & Params ============================ */
-
-def buildParams(List plist) {
-  def m = [:]
-  (plist ?: []).each { kv ->
-    if (kv?.name) m[kv.name.toString()] = (kv.value == null ? '' : kv.value.toString())
-  }
-  return [
-    string(name: 'PARAM1', value: m['PARAM1'] ?: ''),
-    string(name: 'PARAM2', value: m['PARAM2'] ?: ''),
-    string(name: 'PARAM3', value: m['PARAM3'] ?: ''),
-    string(name: 'PARAM4', value: m['PARAM4'] ?: '')
-  ]
-}
-
+// Returns the username who started the build (no extra plugin needed).
+// Works for user, timer, SCM, upstream, etc. Falls back gracefully.
 @NonCPS
-def safeMerge(String existingText, String batchText, String source) {
-  def existing = parsePlainSafe(existingText) ?: [jobs: [], deadLetter: []]
-  if (!(existing.jobs instanceof List)) existing.jobs = []
-  if (!(existing.deadLetter instanceof List)) existing.deadLetter = []
-
-  def batch = parsePlainSafe(batchText) ?: [jobs: []]
-  def now = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-
-  (batch.jobs ?: []).each { j ->
-    def item = toPlain(j) ?: [:]
-    if (!(item.parameters instanceof List)) item.parameters = []
-    item.source     = source?.toString()
-    item.receivedAt = now
-    item.status     = 'queued'
-    item.attempts   = 0
-    existing.jobs << item
+def getBuildUser() {
+  def causes = currentBuild.rawBuild?.getCauses() ?: []
+  // Prefer UserIdCause / UserCause if present
+  def userCause = causes.find { it.class.simpleName.contains('UserIdCause') || it.class.simpleName.contains('UserCause') }
+  if (userCause) {
+    // Try common getters without importing plugin classes
+    def u = null
+    try { u = userCause.getUserId() } catch (ignored) {}
+    try { if (!u) u = userCause.getUserName() } catch (ignored) {}
+    return (u ?: 'unknown-user').toString()
   }
-
-  return groovy.json.JsonOutput.toJson(existing)
+  // Timer, SCM, upstream, etc.
+  def first = causes ? causes[0] : null
+  return first ? first.getShortDescription() : 'non-interactive-trigger'
 }
 
-@NonCPS
-def parsePlainSafe(String jsonText) {
-  if (!jsonText) return null
-  def t = jsonText.trim()
-  if (t.length() == 0) return null
-  try {
-    def p = new groovy.json.JsonSlurper().parseText(t)
-    return toPlain(p)
-  } catch (Throwable ignored) {
-    return null
+// Put your per-node work here.
+// You can add shell steps, git operations, build triggers, etc.
+def doWork(String agentLabel, def paramsObj) {
+  echo "doWork() on ${agentLabel} with RUN_MODE=${paramsObj.RUN_MODE}, PARAM1=${paramsObj.PARAM1}"
+
+  // Example workload — replace with your real steps
+  if (isUnix()) {
+    sh """
+      echo "[\$(date +%T)] ${agentLabel}: starting work (mode=${paramsObj.RUN_MODE})"
+      sleep 2
+      echo "[\$(date +%T)] ${agentLabel}: finishing work"
+    """
+  } else {
+    powershell """
+      Write-Host "[\$(Get-Date -Format T)] ${agentLabel}: starting work (mode=${paramsObj.RUN_MODE})"
+      Start-Sleep -Seconds 2
+      Write-Host "[\$(Get-Date -Format T)] ${agentLabel}: finishing work"
+    """
   }
 }
-
-@NonCPS
-def toPlain(Object o) {
-  if (o instanceof Map)  { def m = [:]; o.each { k,v -> m[(k?.toString())] = toPlain(v) }; return m }
-  if (o instanceof List) { def l = [];  o.each { v -> l << toPlain(v) }; return l }
-  return o
-}
-
-@NonCPS
-def toJsonString(Object o) { groovy.json.JsonOutput.toJson(o) }
