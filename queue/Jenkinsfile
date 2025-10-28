@@ -6,7 +6,7 @@
 
 pipeline {
   agent{
-    label 'built-in Node'
+    label 'Built-In Node'
   }
   options { timestamps(); disableConcurrentBuilds() }
 
