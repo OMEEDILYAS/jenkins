@@ -75,7 +75,7 @@ pipeline {
             //def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
             for (job in allJobs) {
               if (job.name == params.JOB_TO_RUN) {
-                selectedJob = job
+                selectedJob.toString() = job
                 break
               }
             }
