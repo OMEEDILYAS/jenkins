@@ -18,8 +18,8 @@ pipeline{
           def jobsParam = params.ListOfJobs
           def jobsJson = new groovy.json.JsonSlurper().parseText(jobsParam)
           echo "Jobs to run: ${jobsParam}"
-          def liveJobs = jobsJson.parameters.findall { it.name == 'env' && it.value == 'live' }
-          def stagingJobs = jobsJson.parameters.findall { it.name == 'env' && it.value == 'staging' }
+          def liveJobs = jobsJson.parameters.findAll { it.name == 'env' && it.value == 'live' }
+          def stagingJobs = jobsJson.parameters.findAll { it.name == 'env' && it.value == 'staging' }
           echo "live jobs: ${liveJobs}"
           echo "staging jobs: ${stagingJobs}"
         }
