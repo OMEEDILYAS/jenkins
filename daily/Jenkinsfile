@@ -20,9 +20,8 @@ pipeline {
       }
       steps {
         script {
-          import groovy.json.JsonSlurper
           def jsonText = readFile('daily/daily.json')
-          def parsedJson = new JsonSlurper().parseText(jsonText)
+          def parsedJson = new groovy.json.JsonSlurper().parseText(jsonText)
           echo "Sending over to queue: ${jsonText}"
           build job: 'optimized/queue',
                 wait: false,
