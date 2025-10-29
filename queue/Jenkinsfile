@@ -33,10 +33,18 @@ pipeline {
       }
     }
     stage('live run') {
-      steps { echo "Live run for jobs: ${liveJobs}" }
+      steps {
+        script {
+          echo "Live run for jobs: ${liveJobs}" 
+        }
+      }
     }
     stage('staging run') {
-      steps { echo "Staging run for jobs: ${stagingJobs}" }
+      steps { 
+        script {
+          echo "Staging run for jobs: ${stagingJobs}" 
+        }
+      }
     }
   }
 }
