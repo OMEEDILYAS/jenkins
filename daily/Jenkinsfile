@@ -88,6 +88,7 @@ pipeline {
               echo "Checking job: ${job}"
               if (job && job.name?.toString() == params.JOB_TO_RUN?.toString()) {
                 selectedJob = job
+                echo "Selected job: ${selectedJob}"
                 break
               }
             }
