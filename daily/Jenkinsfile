@@ -72,15 +72,10 @@ pipeline {
               )
             }
           } else {
-            //def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
+            def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
             echo "running the first else block just testing: .... ${allJobs}"
-            for (job in allJobs) {
-              echo "Checking job: ${job.name.toString()}"
-              if (job.name.toString() == params.JOB_TO_RUN) {
-                selectedJob == job
-                break
-              }
-            }
+            echo "selected job is: .... ${selectedJob}"
+            
             if (params.ENV_TO_RUN == 'live') {
               echo "Running job ${params.JOB_TO_RUN} in live environment"
               selectedJob.priority = 14
