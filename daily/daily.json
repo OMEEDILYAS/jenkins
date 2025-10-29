@@ -4,7 +4,6 @@
       "name": "one",
       "category": "daily",
       "priority": 6,
-      "wait": true,
       "job": "optimized/queue",
       "parameters": [
         { "name": "PARAM1", "value": "alpha" },
@@ -18,7 +17,6 @@
       "category": "daily",
       "priority": 6,
       "job": "optimized/queue",
-      "wait": true,
       "parameters": [
         { "name": "PARAM1", "value": "x" },
         { "name": "PARAM2", "value": "y" },
@@ -31,7 +29,6 @@
       "category": "daily",
       "priority": 6,
       "job": "optimized/queue",
-      "wait": true,
       "parameters": [
         { "name": "PARAM1", "value": "red" },
         { "name": "PARAM2", "value": "blue" },
@@ -44,7 +41,6 @@
       "category": "daily",
       "priority": 6,
       "job": "optimized/queue",
-      "wait": true,
       "parameters": [
         { "name": "PARAM1", "value": "one" },
         { "name": "PARAM2", "value": "two" },
@@ -57,7 +53,6 @@
       "category": "daily",
       "priority": 6,
       "job": "optimized/queue",
-      "wait": true,
       "parameters": [
         { "name": "PARAM1", "value": "spring" },
         { "name": "PARAM2", "value": "summer" },
