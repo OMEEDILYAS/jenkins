@@ -29,20 +29,24 @@ pipeline {
 
           echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
           echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
+          writeFile file: 'live_queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
+          writeFile file: 'staging_queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
         }
       }
     }
     stage('live run') {
       steps {
         script {
-          echo "Live run for jobs: ${liveJobs}" 
+          def liveJobs = new groovy.json.JsonSlurper().parseText(readFile('live_queue.json'))
+          echo "n: ${liveJobs.collect{ it.name }.join(', ')}"
         }
       }
     }
     stage('staging run') {
       steps { 
         script {
-          echo "Staging run for jobs: ${stagingJobs}" 
+          def stagingJobs = new groovy.json.JsonSlurper().parseText(readFile('staging_queue.json'))
+          echo "n: ${liveJobs.collect{ it.name }.join(', ')}" 
         }
       }
     }
