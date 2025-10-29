@@ -1,85 +1,82 @@
 pipeline {
-  agent {
-    label 'master'
-  }
+  agent { label 'master' }
   parameters {
-    string(name: 'ListOfJobs', defaultValue: '', description: 'upstream jobs to run')
+    string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON')
   }
   options {
     buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
   }
-  // ⚠️ You can’t call methods inside environment; remove this or move into a script if you need it.
   environment {
-    BUILD_TRIGGER_BY = 'unknown'
+    BUILD_TRIGGER_BY = 'unknown' // avoid calling methods here
   }
   stages {
     stage('prep') {
       steps {
         script {
-          try {
-            def incomingJobs = new groovy.json.JsonSlurper().parseText(params.ListOfJobs)
-            echo "Incoming jobs type: ${incomingJobs.getClass()}"
-            echo "Incoming jobs content: ${incomingJobs}"
-
-            if (!(incomingJobs instanceof Map) || !(incomingJobs.jobs instanceof List)) {
-              error "ListOfJobs parameter is not a valid JSON object with 'jobs' array."
-            }
-
-            // Convert to plain structures so LazyMap doesn't break CPS
-            incomingJobs = toPlain(incomingJobs)
-            echo "Converted jobs to plain object: ${incomingJobs}"
-
-            def stagingJobs = incomingJobs.jobs.findAll { job ->
-              job.parameters.find { param ->
-                param.name == 'env' && param.value == 'staging'
-              }
-            }
-            def liveJobs = incomingJobs.jobs.findAll { job ->
-              job.parameters.find { param ->
-                param.name == 'env' && param.value == 'live'
-              }
-            }
-
-            echo "Staging jobs: ${stagingJobs.collect { it.name }}"
-            echo "Live jobs: ${liveJobs.collect { it.name }}"
-          } catch (Exception e) {
-            error "Error parsing ListOfJobs parameter: ${e.message}"
+          if (!params.ListOfJobs?.trim()) {
+            error 'ListOfJobs is empty; expected JSON payload from upstream.'
           }
+
+          // Parse + normalize to: [jobs: <List>]
+          def incomingJobs = parseJobsToPlain(params.ListOfJobs)
+
+          def stagingJobs = incomingJobs.jobs.findAll { job ->
+            (job.parameters ?: []).find { p -> p.name == 'env' && p.value?.toString()?.toLowerCase() == 'staging' }
+          }
+          def liveJobs = incomingJobs.jobs.findAll { job ->
+            (job.parameters ?: []).find { p -> p.name == 'env' && p.value?.toString()?.toLowerCase() == 'live' }
+          }
+
+          echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
+          echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
         }
       }
     }
     stage('live run') {
-      steps {
-        script {
-          echo "Live run for jobs: ${params.ListOfJobs}"
-        }
-      }
+      steps { echo "Live run for jobs: ${params.ListOfJobs.take(200)}..." }
     }
     stage('staging run') {
-      steps {
-        script {
-          echo "Staging run for jobs: ${params.ListOfJobs}"
-        }
-      }
+      steps { echo "Staging run for jobs: ${params.ListOfJobs.take(200)}..." }
     }
   }
+}
+
+// ---- Helpers (no plugins, CPS-safe) ----
+@NonCPS
+def parseJobsToPlain(String raw) {
+  def slurper = new groovy.json.JsonSlurper()
+  Object obj
+  try {
+    obj = slurper.parseText(raw)
+  } catch (e) {
+    throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw.take(200)}")
+  }
+
+  // Handle double-encoded JSON strings like "\"{...}\"" or "\"[...]\""
+  if (obj instanceof String) {
+    obj = slurper.parseText(obj)
+  }
+
+  // Accept either { "jobs": [...] } or bare [...] and wrap it
+  if (obj instanceof List) {
+    obj = [jobs: obj]
+  } else if (!(obj instanceof Map) || !(obj.jobs instanceof List)) {
+    throw new Exception("Expected top-level {\"jobs\":[...] } or a bare [ ... ]. Got ${obj?.getClass()?.name}.")
+  }
+
+  // Deep-convert LazyMap to plain Maps/Lists
+  return toPlain(obj)
 }
 
 @NonCPS
 def toPlain(Object obj) {
   if (obj instanceof Map) {
-    def plainMap = [:]
-    obj.each { key, value ->
-      plainMap[key.toString()] = toPlain(value)  // ✅ fixed: 'key', not 'k'
-    }
-    return plainMap
+    def m = [:]
+    obj.each { key, value -> m[key?.toString()] = toPlain(value) }
+    return m
   } else if (obj instanceof List) {
-    def plainList = []
-    obj.each { item ->
-      plainList.add(toPlain(item))
-    }
-    return plainList
+    return obj.collect { toPlain(it) }
   } else {
-    return obj  // ✅ return value directly, no echo or error here
+    return obj  // primitives/strings
   }
 }
