@@ -39,11 +39,10 @@ pipeline {
       }
       steps {
         script {
-          import groovy.json.JsonSlurper
           
           // Read and parse JSON
           def jsonText = readFile('daily/daily.json')
-          def parsedJson = new JsonSlurper().parseText(jsonText)
+          def parsedJson = new groovy.json.JsonSlurper().parseText(jsonText)
           def allJobs = parsedJson.jobs ?: parsedJson  // Handle both {jobs:[..]} and direct array format
           
           // Debug output
