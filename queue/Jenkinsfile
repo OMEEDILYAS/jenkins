@@ -1,26 +1,37 @@
-pipeline {
-  agent none
-
+pipeline{
+  agent {
+    label 'master'
+  }
+  parameters {
+    string(name: 'ListOfJobs', defaultValue: '', description: 'upstream jobs to run')
+  }
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
+  }
+  environment {
+    BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId}"
+  }
   stages {
-    stage('Run on all agents') {
-      matrix {
-        axes {
-          axis {
-            name 'AGENT'
-            values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
-          }
+    stage('prep'){
+      steps {
+        script {
+          def jobsParam = params.ListOfJobs
+          echo "Jobs to run: ${jobsParam}"
+
         }
-
-        agent { label "${AGENT}" }
-
-        stages {
-          stage('Sleep 20s') {
-            steps {
-              echo "Running on ${env.NODE_NAME}..."
-              sleep 20
-              echo "Finished on ${env.NODE_NAME}!"
-            }
-          }
+      }
+    }
+    stage('live run') {
+      steps {
+        script {
+          echo "Live run for jobs: ${params.ListOfJobs}"
+        }
+      }
+    }
+    stage('staging run') {
+      steps {
+        script {
+          echo "Staging run for jobs: ${params.ListOfJobs}"
         }
       }
     }
