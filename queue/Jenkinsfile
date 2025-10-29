@@ -30,7 +30,7 @@ pipeline{
             def liveJobs = incoming_jobs.findAll { it.parameters.find { param -> param.name == 'Env_TO_RUN' && param.value == 'live' } }
             echo "Staging jobs: ${stagingJobs}"
             echo "Live jobs: ${liveJobs}"
-          }chatch (Exception e){
+          } catch (Exception e) {
             error "Error parsing ListOfJobs parameter: ${e.message}"
           }
         }
