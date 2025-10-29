@@ -15,13 +15,24 @@ pipeline{
     stage('prep'){
       steps {
         script {
-          def jobsParam = params.ListOfJobs
-          def jobsJson = new groovy.json.JsonSlurper().parseText(jobsParam)
-          echo "Jobs to run: ${jobsParam}"
-          def liveJobs = jobsJson.parameters.findAll { it.name == 'env' && it.value == 'live' }
-          def stagingJobs = jobsJson.parameters.findAll { it.name == 'env' && it.value == 'staging' }
-          echo "live jobs: ${liveJobs}"
-          echo "staging jobs: ${stagingJobs}"
+          try{
+            def incomingJobs = new groovy.json.JsonSlurper().parseText(params.ListOfJobs)
+            echo "Incoming jobs type: ${incomingJobs.getClass()}"
+            echo "Incoming jobs content: ${incomingJobs}"
+            if (!(incomingJobs instanceof List || incomingJobs instanceof Map)) {
+              error "ListOfJobs parameter is not a valid JSON array or object."
+            }
+            echo "Prepared jobs: ${incomingJobs}"
+            incomingJobs = toPlain(incomingJobs)
+            echo "Converted jobs to plain object: ${incomingJobs}"
+
+            def stagingJobs = incoming_jobs.findAll { it.parameters.find { param -> param.name == 'Env_TO_RUN' && param.value == 'staging' } }
+            def liveJobs = incoming_jobs.findAll { it.parameters.find { param -> param.name == 'Env_TO_RUN' && param.value == 'live' } }
+            echo "Staging jobs: ${stagingJobs}"
+            echo "Live jobs: ${liveJobs}"
+          }chatch (Exception e){
+            error "Error parsing ListOfJobs parameter: ${e.message}"
+          }
         }
       }
     }
@@ -39,5 +50,24 @@ pipeline{
         }
       }
     }
+  }
+}
+@nonCPS
+def toPlain(Object obj) {
+  echo "Converting to plain object: ${obj}"
+  if (obj instanceof Map) {
+    def plainMap = [:]
+    obj.each { key, value ->
+      plainMap[(k?.toString())] = toPlain(value)
+    }
+    return plainMap
+  } else if (obj instanceof List) {
+    def plainList = []
+    obj.each { item ->
+      plainList.add(toPlain(item))
+    }
+    return plainList
+  } else {
+    error " passed down jobs are not in expected format. ${obj.getClass()}"
   }
 }
