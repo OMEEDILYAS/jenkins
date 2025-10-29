@@ -59,6 +59,7 @@ pipeline {
                 job.priority = 12
                 echo "Set job ${job.name} priority to ${job.priority}"
               }
+              echo "jobs to run: ${selectedJobs}"
               build(
                 wait: false,
                 job: 'optimized/queue',
@@ -75,6 +76,7 @@ pipeline {
                 if (envParam) {
                   envParam.value = 'staging'
                 }
+                echo "jobs to run with priority and env changed: ${selectedJobs}"
               }
               build(
                 wait: false,
