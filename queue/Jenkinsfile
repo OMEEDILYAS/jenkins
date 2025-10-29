@@ -17,7 +17,10 @@ pipeline{
         script {
           def jobsParam = params.ListOfJobs
           echo "Jobs to run: ${jobsParam}"
-
+          def liveJobs = jobsParam.parameters.findall { it.name == 'env' && it.value == 'live' }
+          def stagingJobs = jobsParam.parameters.findall { it.name == 'env' && it.value == 'staging' }
+          echo "live jobs: ${liveJobs}"
+          echo "staging jobs: ${stagingJobs}"
         }
       }
     }
