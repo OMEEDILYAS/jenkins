@@ -1,4 +1,4 @@
-pipeline{
+pipeline {
   agent {
     label 'master'
   }
@@ -8,28 +8,40 @@ pipeline{
   options {
     buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
   }
+  // ⚠️ You can’t call methods inside environment; remove this or move into a script if you need it.
   environment {
-    BUILD_TRIGGER_BY = "${currentBuild.getBuildCauses()[0].userId}"
+    BUILD_TRIGGER_BY = 'unknown'
   }
   stages {
-    stage('prep'){
+    stage('prep') {
       steps {
         script {
-          try{
+          try {
             def incomingJobs = new groovy.json.JsonSlurper().parseText(params.ListOfJobs)
             echo "Incoming jobs type: ${incomingJobs.getClass()}"
             echo "Incoming jobs content: ${incomingJobs}"
-            if (!(incomingJobs instanceof List || incomingJobs instanceof Map)) {
-              error "ListOfJobs parameter is not a valid JSON array or object."
+
+            if (!(incomingJobs instanceof Map) || !(incomingJobs.jobs instanceof List)) {
+              error "ListOfJobs parameter is not a valid JSON object with 'jobs' array."
             }
-            echo "Prepared jobs: ${incomingJobs}"
+
+            // Convert to plain structures so LazyMap doesn't break CPS
             incomingJobs = toPlain(incomingJobs)
             echo "Converted jobs to plain object: ${incomingJobs}"
 
-            def stagingJobs = incoming_jobs.findAll { it.parameters.find { param -> param.name == 'Env_TO_RUN' && param.value == 'staging' } }
-            def liveJobs = incoming_jobs.findAll { it.parameters.find { param -> param.name == 'Env_TO_RUN' && param.value == 'live' } }
-            echo "Staging jobs: ${stagingJobs}"
-            echo "Live jobs: ${liveJobs}"
+            def stagingJobs = incomingJobs.jobs.findAll { job ->
+              job.parameters.find { param ->
+                param.name == 'env' && param.value == 'staging'
+              }
+            }
+            def liveJobs = incomingJobs.jobs.findAll { job ->
+              job.parameters.find { param ->
+                param.name == 'env' && param.value == 'live'
+              }
+            }
+
+            echo "Staging jobs: ${stagingJobs.collect { it.name }}"
+            echo "Live jobs: ${liveJobs.collect { it.name }}"
           } catch (Exception e) {
             error "Error parsing ListOfJobs parameter: ${e.message}"
           }
@@ -52,13 +64,13 @@ pipeline{
     }
   }
 }
+
 @NonCPS
 def toPlain(Object obj) {
-  echo "Converting to plain object: ${obj}"
   if (obj instanceof Map) {
     def plainMap = [:]
     obj.each { key, value ->
-      plainMap[(k?.toString())] = toPlain(value)
+      plainMap[key.toString()] = toPlain(value)  // ✅ fixed: 'key', not 'k'
     }
     return plainMap
   } else if (obj instanceof List) {
@@ -68,6 +80,6 @@ def toPlain(Object obj) {
     }
     return plainList
   } else {
-    error " passed down jobs are not in expected format. ${obj.getClass()}"
+    return obj  // ✅ return value directly, no echo or error here
   }
 }
