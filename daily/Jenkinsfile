@@ -20,7 +20,9 @@ pipeline {
       }
       steps {
         script {
+          import groovy.json.JsonSlurper
           def jsonText = readFile('daily/daily.json')
+          def parsedJson = new JsonSlurper().parseText(jsonText)
           echo "Sending over to queue: ${jsonText}"
           build job: 'optimized/queue',
                 wait: false,
@@ -38,9 +40,17 @@ pipeline {
       }
       steps {
         script {
+          import groovy.json.JsonSlurper
+          
+          // Read and parse JSON
           def jsonText = readFile('daily/daily.json')
-          // use jsonslurper to parse jsontext here
-          def allJobs = jsonText
+          def parsedJson = new JsonSlurper().parseText(jsonText)
+          def allJobs = parsedJson.jobs ?: parsedJson  // Handle both {jobs:[..]} and direct array format
+          
+          // Debug output
+          echo "JSON structure class: ${allJobs.getClass()}"
+          echo "First job in list: ${allJobs ? allJobs[0] : 'No jobs found'}"
+          
           def selectedJobs = []
 
           if (params.JOB_TO_RUN == 'all') {
@@ -54,28 +64,40 @@ pipeline {
                 wait: false,
                 job: 'optimized/queue',
                 parameters: [
-                  string(name: 'ListOfJobs', value: "selectedJobs"),
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson(selectedJobs)),
                 ]
               )
             } else {
               echo "Running all jobs in staging environment"
               for (job in selectedJobs) {
                 job.priority = 4
-                job.parameters.find { it.name == 'env' }.value = 'staging'
+                def envParam = job.parameters?.find { it.name == 'env' }
+                if (envParam) {
+                  envParam.value = 'staging'
+                }
               }
               build(
                 wait: false,
                 job: 'optimized/queue',
                 parameters: [
-                  string(name: 'ListOfJobs', value: "selectedJobs"),
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson(selectedJobs)),
                 ]
               )
             }
           } else {
-            def selectedJob = allJobs.find { it.name == params.JOB_TO_RUN }
-            echo "running the first else block just testing: .... ${allJobs}"
-            echo "selected job is: .... ${selectedJob}"
+            def selectedJob = null
+            for (job in allJobs) {
+              echo "Checking job: ${job}"
+              if (job && job.name?.toString() == params.JOB_TO_RUN?.toString()) {
+                selectedJob = job
+                break
+              }
+            }
             
+            if (selectedJob == null) {
+              error "Could not find job with name: ${params.JOB_TO_RUN}"
+            }
+
             if (params.ENV_TO_RUN == 'live') {
               echo "Running job ${params.JOB_TO_RUN} in live environment"
               selectedJob.priority = 14
@@ -83,18 +105,21 @@ pipeline {
                 wait: false,
                 job: 'optimized/queue',
                 parameters: [
-                  string(name: 'ListOfJobs', value: "[selectedJob]"),
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson([selectedJob])),
                 ]
               )
             } else {
               echo "Running job ${params.JOB_TO_RUN} in staging environment"
               selectedJob.priority = 6
-              selectedJob.parameters.find { it.name == 'env' }.value = 'staging'
+              def envParam = selectedJob.parameters?.find { it.name == 'env' }
+              if (envParam) {
+                envParam.value = 'staging'
+              }
               build(
                 wait: false,
                 job: 'optimized/queue',
                 parameters: [
-                  string(name: 'ListOfJobs', value: "[selectedJob]"),
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson([selectedJob])),
                 ]
               )
             }
@@ -103,7 +128,7 @@ pipeline {
       }
     }
   }
-  post{
+  post {
     always {
       echo "Daily Jenkinsfile execution completed."
       cleanWs()
