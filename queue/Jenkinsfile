@@ -52,7 +52,7 @@ pipeline{
     }
   }
 }
-@nonCPS
+@NonCPS
 def toPlain(Object obj) {
   echo "Converting to plain object: ${obj}"
   if (obj instanceof Map) {
