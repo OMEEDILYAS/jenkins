@@ -33,10 +33,10 @@ pipeline {
       }
     }
     stage('live run') {
-      steps { echo "Live run for jobs: ${params.ListOfJobs.take(200)}..." }
+      steps { echo "Live run for jobs: ${liveJobs}" }
     }
     stage('staging run') {
-      steps { echo "Staging run for jobs: ${params.ListOfJobs.take(200)}..." }
+      steps { echo "Staging run for jobs: ${stagingJobs}" }
     }
   }
 }
