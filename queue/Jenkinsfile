@@ -39,11 +39,11 @@ pipeline {
           echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
 
           // Write queue files on master workspace
-          writeFile file: 'live_queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
-          writeFile file: 'staging_queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
+          writeFile file: 'queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
+          writeFile file: 'queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
 
           // Make them available to all matrix workers
-          stash name: 'queues', includes: 'live_queue.json, staging_queue.json'
+          stash name: 'queues', includes: 'queue.json'
         }
       }
     }
@@ -53,9 +53,9 @@ pipeline {
       // Gate by content on master workspace (files exist & not empty array)
       when {
         expression {
-          fileExists('live_queue.json') &&
-          readFile('live_queue.json')?.trim() &&
-          readFile('live_queue.json').trim() != '[]'
+          fileExists('queue.json') &&
+          readFile('queue.json')?.trim() &&
+          readFile('queue.json').trim() != '[]'
         }
       }
       matrix {
@@ -74,7 +74,7 @@ pipeline {
                 // Bring queue files into this agent workspace
                 unstash 'queues'
 
-                def allLive = parsePlainSafe(readFile('live_queue.json')) as List
+                def allLive = parsePlainSafe(readFile('queue.json')) as List
 
                 // Shard jobs by agent (round-robin by index)
                 int shards = 4
@@ -108,9 +108,9 @@ pipeline {
     stage('staging run') {
       when {
         expression {
-          fileExists('staging_queue.json') &&
-          readFile('staging_queue.json')?.trim() &&
-          readFile('staging_queue.json').trim() != '[]'
+          fileExists('queue.json') &&
+          readFile('queue.json')?.trim() &&
+          readFile('queue.json').trim() != '[]'
         }
       }
       matrix {
@@ -129,7 +129,7 @@ pipeline {
                 // Bring queue files into this agent workspace
                 unstash 'queues'
 
-                def allStaging = parsePlainSafe(readFile('staging_queue.json')) as List
+                def allStaging = parsePlainSafe(readFile('queue.json')) as List
 
                 int shards = 4
                 int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
