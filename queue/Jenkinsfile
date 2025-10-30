@@ -39,6 +39,7 @@ pipeline {
           // ✅ Parse via NonCPS helper (returns plain List/Map), not JsonSlurper here
           def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
           echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
+          echo "Starting live run for ${liveJobs}"
         }
       }
     }
