@@ -51,6 +51,7 @@ pipeline {
           // ✅ Parse via NonCPS helper
           def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
           echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
+          echo "Starting staging run for ${stagingJobs}"
         }
       }
     }
