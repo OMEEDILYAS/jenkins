@@ -22,6 +22,7 @@ pipeline {
           def liveJobs = incomingJobs.jobs.findAll { job ->
             (job.parameters ?: []).find { p -> p.name == 'env' && p.value?.toString()?.toLowerCase() == 'live' }
           }
+          // new breanch
 
           echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
           echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
