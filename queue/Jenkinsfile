@@ -1,191 +1,137 @@
 pipeline {
-  agent { label 'master' }   // Orchestrate on master/controller
+  agent { label 'master' }
 
   parameters {
-    string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON payload: { "jobs": [...] } or bare array')
+    string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON payload ({"jobs":[...]})')
   }
 
   options {
     timestamps()
-    disableConcurrentBuilds()
-    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
+    buildDiscarder(logRotator(numToKeepStr: '20', daysToKeepStr: '30'))
   }
 
   environment {
-    BUILD_TRIGGER_BY = 'unknown' // avoid calling methods in environment{}
+    // Path for the unified queue; adjust if you prefer a different location.
+    QUEUE_PATH = 'queue.json'
   }
 
   stages {
 
-    stage('prep') {
+    stage('Ingest to queue.json') {
       steps {
         script {
           if (!params.ListOfJobs?.trim()) {
             error 'ListOfJobs is empty; expected JSON payload from upstream.'
           }
 
-          // Parse into plain Maps/Lists (CPS-safe)
-          def incoming = parseJobsToPlain(params.ListOfJobs)
-
-          // Split by env
-          def liveJobs = incoming.jobs.findAll { j ->
-            (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'live' }
-          }
-          def stagingJobs = incoming.jobs.findAll { j ->
-            (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'staging' }
+          // Create base file if missing (kept tiny to avoid race; real serialization is the lock)
+          if (!fileExists(env.QUEUE_PATH)) {
+            writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
           }
 
-          echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
-          echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
+          // All queue reads/writes serialized by a single lock
+          lock(resource: 'queue-json') {
+            // 1) Read current queue
+            def curText = readFile(env.QUEUE_PATH)
+            def cur = parsePlainSafe(curText) ?: [jobs: [], deadLetter: []]
+            if (!(cur.jobs instanceof List))       cur.jobs = []
+            if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
-          // Write a single queue file on master workspace (all jobs). Workers will filter by env.
-          writeFile file: 'queue.json', text: groovy.json.JsonOutput.toJson(incoming.jobs)
+            // 2) Parse incoming
+            def incoming = parseJobsToPlain(params.ListOfJobs) // returns [jobs: [...]]
+            def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
 
-          // Make it available to all matrix workers
-          stash name: 'queues', includes: 'queue.json'
-        }
-      }
-    }
+            // 3) Normalize & append
+            int added = 0
+            (incoming.jobs ?: []).each { j ->
+              def item = toPlain(j) ?: [:]
+              if (!(item.parameters instanceof List)) item.parameters = []
 
-    /* ====================== LIVE: matrix across agents ====================== */
-    stage('live run') {
-      // Gate by content on master workspace (files exist & not empty array)
-      when {
-        expression {
-          fileExists('queue.json') &&
-          readFile('queue.json')?.trim() &&
-          readFile('queue.json').trim() != '[]'
-        }
-      }
-      matrix {
-        axes {
-          axis {
-            name 'AGENT_LABEL'
-            values 'agent-1','agent-2','agent-3','agent-4'
-          }
-        }
-        agent { label "${AGENT_LABEL}" }
+              // Extract env from parameters; if missing, default to "staging" and add it to parameters
+              def envParam = item.parameters.find { it?.name?.toString() == 'env' }
+              def envValue = envParam?.value?.toString()?.toLowerCase()
+              if (!envValue) {
+                envValue = 'staging' // <-- default per your rule
+                item.parameters << [name: 'env', value: envValue]
+              }
+              item.env = envValue  // top-level copy for fast filtering later
 
-        stages {
-          stage('Live worker') {
-            steps {
-              script {
-                // Bring queue file into this agent workspace
-                unstash 'queues'
+              // Default priority if missing/invalid
+              def pr = null
+              try { pr = (item.priority as Integer) } catch (ignored) {}
+              if (pr == null) pr = 6           // <-- default per your rule
+              item.priority = pr
 
-                def all = parsePlainSafe(readFile('queue.json')) as List
-                // Filter only live jobs
-                def allLive = (all ?: []).findAll { j ->
-                  (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'live' }
-                }
+              // Ensure core fields
+              item.status     = 'queued'
+              item.attempts   = (item.attempts ?: 0) as int
+              item.receivedAt = item.receivedAt ?: nowIso
 
-                // Shard jobs by agent (round-robin by index)
-                int shards = 4
-                int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
-                def myJobs = []
-                allLive.eachWithIndex { j, i -> if ((i % shards) == shardIndex) myJobs << j }
-
-                echo "[${env.AGENT_LABEL}] live shard size=${myJobs.size()} of total=${allLive.size()}"
-                echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
-
-                def toParamList = { plist ->
-                  (plist ?: []).collect { p ->
-                    string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
-                  }
-                }
-
-                myJobs.each { j ->
-                  def target = j.job?.toString()
-                  if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
-                  echo "[${env.AGENT_LABEL}] ▶ live: ${j.name} -> ${target}"
-                  build job: target, wait: true, parameters: toParamList(j.parameters)
-                }
+              // Minimal validation: must have a downstream job name
+              if (!item.job) {
+                item.error = 'missing job name'
+                (cur.deadLetter as List) << item
+              } else {
+                (cur.jobs as List) << item
+                added++
               }
             }
-          }
-        }
-      }
-    }
 
-    /* ==================== STAGING: matrix across agents ==================== */
-    stage('staging run') {
-      when {
-        expression {
-          fileExists('queue.json') &&
-          readFile('queue.json')?.trim() &&
-          readFile('queue.json').trim() != '[]'
-        }
-      }
-      matrix {
-        axes {
-          axis {
-            name 'AGENT_LABEL'
-            values 'agent-1','agent-2','agent-3','agent-4'
-          }
-        }
-        agent { label "${AGENT_LABEL}" }
-
-        stages {
-          stage('Staging worker') {
-            steps {
-              script {
-                // Bring queue file into this agent workspace
-                unstash 'queues'
-
-                def all = parsePlainSafe(readFile('queue.json')) as List
-                // Filter only staging jobs
-                def allStaging = (all ?: []).findAll { j ->
-                  (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'staging' }
-                }
-
-                int shards = 4
-                int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
-                def myJobs = []
-                allStaging.eachWithIndex { j, i -> if ((i % shards) == shardIndex) myJobs << j }
-
-                echo "[${env.AGENT_LABEL}] staging shard size=${myJobs.size()} of total=${allStaging.size()}"
-                echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
-
-                def toParamList = { plist ->
-                  (plist ?: []).collect { p ->
-                    string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
-                  }
-                }
-
-                myJobs.each { j ->
-                  def target = j.job?.toString()
-                  if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
-                  echo "[${env.AGENT_LABEL}] ▶ staging: ${j.name} -> ${target}"
-                  build job: target, wait: true, parameters: toParamList(j.parameters)
-                }
-              }
+            // Optional: keep a light sort (priority desc, then FIFO by receivedAt)
+            (cur.jobs as List).sort { a, b ->
+              def pa = (a.priority ?: 0) as int
+              def pb = (b.priority ?: 0) as int
+              def byPrio = (pb <=> pa)
+              if (byPrio != 0) return byPrio
+              (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
             }
-          }
+
+            // 4) Write back pretty JSON
+            def outText = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+            writeFile file: env.QUEUE_PATH, text: outText
+
+            echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
+            def names = (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
+            echo "Current jobs: ${names}"
+          } // lock
         }
       }
     }
   }
 }
 
-/* ====================== Helpers (no plugins; CPS-safe) ====================== */
+/* ----------------------- Helpers (CPS-safe) ----------------------- */
 
 @NonCPS
 def parseJobsToPlain(String raw) {
-  def slurper = new groovy.json.JsonSlurper()
-  Object obj = slurper.parseText(raw?.trim())
-  if (obj instanceof String) obj = slurper.parseText(obj)   // handle double-encoded
-  if (obj instanceof List) obj = [jobs: obj]
-  else if (!(obj instanceof Map) || !(obj.jobs instanceof List))
-    throw new Exception('Expected top-level {"jobs":[...]} or bare array.')
+  def sl = new groovy.json.JsonSlurper()
+  Object obj
+  try {
+    obj = sl.parseText(raw?.trim())
+  } catch (e) {
+    throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw?.take(200)}")
+  }
+  if (obj instanceof String) { // double-encoded safeguard
+    obj = sl.parseText(obj)
+  }
+  if (obj instanceof List) {
+    obj = [jobs: obj]
+  } else if (!(obj instanceof Map) || !(obj.jobs instanceof List)) {
+    throw new Exception('Expected top-level {"jobs":[...]} or a bare array.')
+  }
   return toPlain(obj)
 }
 
 @NonCPS
-def parsePlainSafe(String jsonText) {
-  if (!jsonText) return null
-  def p = new groovy.json.JsonSlurper().parseText(jsonText.trim())
-  if (p instanceof String) p = new groovy.json.JsonSlurper().parseText(p)
-  return toPlain(p)
+def parsePlainSafe(String text) {
+  if (!text) return null
+  try {
+    def p = new groovy.json.JsonSlurper().parseText(text.trim())
+    if (p instanceof String) p = new groovy.json.JsonSlurper().parseText(p)
+    return toPlain(p)
+  } catch (ignored) {
+    return null
+  }
 }
 
 @NonCPS
