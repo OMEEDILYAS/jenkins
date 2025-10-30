@@ -1,5 +1,5 @@
 pipeline {
-  agent any
+  agent { label 'master' }
   parameters {
     string(name: 'PARAM1', defaultValue: '', description: 'Parameter 1')
     string(name: 'PARAM2', defaultValue: '', description: 'Parameter 2')
