@@ -1,0 +1,30 @@
+pipeline {
+  agent any
+  parameters {
+    string(name: 'PARAM1', defaultValue: '', description: 'Parameter 1')
+    string(name: 'PARAM2', defaultValue: '', description: 'Parameter 2')
+    string(name: 'PARAM3', defaultValue: '', description: 'Parameter 3')
+    string(name: 'ENV',    defaultValue: '', description: 'Environment')
+    string(name: 'SLEEP',  defaultValue: '20', description: 'Sleep time in seconds')
+  }
+
+  stages {
+    stage('Simulate Job') {
+      steps {
+        script {
+          echo "Running job with:"
+          echo "  PARAM1 = ${params.PARAM1}"
+          echo "  PARAM2 = ${params.PARAM2}"
+          echo "  PARAM3 = ${params.PARAM3}"
+          echo "  ENV    = ${params.ENV}"
+          echo "  SLEEP  = ${params.SLEEP}s"
+
+          // Simulate the job doing some work
+          sleep time: params.SLEEP.toInteger(), unit: 'SECONDS'
+
+          echo "✅ Completed job successfully."
+        }
+      }
+    }
+  }
+}
