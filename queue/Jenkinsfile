@@ -7,7 +7,7 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
   }
   environment {
-    BUILD_TRIGGER_BY = 'unknown' // avoid calling methods here
+    BUILD_TRIGGER_BY = 'unknown'
   }
   stages {
     stage('prep') {
@@ -17,7 +17,6 @@ pipeline {
             error 'ListOfJobs is empty; expected JSON payload from upstream.'
           }
 
-          // Parse + normalize to: [jobs: <List>]
           def incomingJobs = parseJobsToPlain(params.ListOfJobs)
 
           def stagingJobs = incomingJobs.jobs.findAll { job ->
@@ -29,24 +28,29 @@ pipeline {
 
           echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
           echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
+
           writeFile file: 'live_queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
           writeFile file: 'staging_queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
         }
       }
     }
+
     stage('live run') {
+      when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
       steps {
         script {
           def liveJobs = new groovy.json.JsonSlurper().parseText(readFile('live_queue.json'))
-          echo "n: ${liveJobs.collect{ it.name }.join(', ')}"
+          echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
         }
       }
     }
+
     stage('staging run') {
+      when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
       steps { 
         script {
           def stagingJobs = new groovy.json.JsonSlurper().parseText(readFile('staging_queue.json'))
-          echo "n: ${liveJobs.collect{ it.name }.join(', ')}" 
+          echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"  // <-- fixed
         }
       }
     }
@@ -63,20 +67,14 @@ def parseJobsToPlain(String raw) {
   } catch (e) {
     throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw.take(200)}")
   }
-
-  // Handle double-encoded JSON strings like "\"{...}\"" or "\"[...]\""
   if (obj instanceof String) {
     obj = slurper.parseText(obj)
   }
-
-  // Accept either { "jobs": [...] } or bare [...] and wrap it
   if (obj instanceof List) {
     obj = [jobs: obj]
   } else if (!(obj instanceof Map) || !(obj.jobs instanceof List)) {
-    throw new Exception("Expected top-level {\"jobs\":[...] } or a bare [ ... ]. Got ${obj?.getClass()?.name}.")
+    throw new Exception("Expected top-level {\"jobs\":[...]} or a bare [ ... ]. Got ${obj?.getClass()?.name}.")
   }
-
-  // Deep-convert LazyMap to plain Maps/Lists
   return toPlain(obj)
 }
 
@@ -89,6 +87,6 @@ def toPlain(Object obj) {
   } else if (obj instanceof List) {
     return obj.collect { toPlain(it) }
   } else {
-    return obj  // primitives/strings
+    return obj
   }
 }
