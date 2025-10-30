@@ -3,12 +3,9 @@ pipeline {
   parameters {
     string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON')
   }
-  options {
-    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
-  }
-  environment {
-    BUILD_TRIGGER_BY = 'unknown'
-  }
+  options { buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30')) }
+  environment { BUILD_TRIGGER_BY = 'unknown' }
+
   stages {
     stage('prep') {
       steps {
@@ -39,7 +36,8 @@ pipeline {
       when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
       steps {
         script {
-          def liveJobs = new groovy.json.JsonSlurper().parseText(readFile('live_queue.json'))
+          // ✅ Parse via NonCPS helper (returns plain List/Map), not JsonSlurper here
+          def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
           echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
         }
       }
@@ -47,46 +45,40 @@ pipeline {
 
     stage('staging run') {
       when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
-      steps { 
+      steps {
         script {
-          def stagingJobs = new groovy.json.JsonSlurper().parseText(readFile('staging_queue.json'))
-          echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"  // <-- fixed
+          // ✅ Parse via NonCPS helper
+          def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
+          echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
         }
       }
     }
   }
 }
 
-// ---- Helpers (no plugins, CPS-safe) ----
+/* ---- Helpers (no plugins, CPS-safe) ---- */
 @NonCPS
 def parseJobsToPlain(String raw) {
   def slurper = new groovy.json.JsonSlurper()
-  Object obj
-  try {
-    obj = slurper.parseText(raw)
-  } catch (e) {
-    throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw.take(200)}")
-  }
-  if (obj instanceof String) {
-    obj = slurper.parseText(obj)
-  }
-  if (obj instanceof List) {
-    obj = [jobs: obj]
-  } else if (!(obj instanceof Map) || !(obj.jobs instanceof List)) {
-    throw new Exception("Expected top-level {\"jobs\":[...]} or a bare [ ... ]. Got ${obj?.getClass()?.name}.")
-  }
-  return toPlain(obj)
+  Object obj = slurper.parseText(raw?.trim())
+  if (obj instanceof String) obj = slurper.parseText(obj) // handle double-encoded
+  if (obj instanceof List) obj = [jobs: obj]
+  else if (!(obj instanceof Map) || !(obj.jobs instanceof List))
+    throw new Exception('Expected top-level {"jobs":[...]} or bare array.')
+  return toPlain(obj) // plain Map/List
+}
+
+@NonCPS
+def parsePlainSafe(String jsonText) {
+  if (!jsonText) return null
+  def p = new groovy.json.JsonSlurper().parseText(jsonText.trim())
+  if (p instanceof String) p = new groovy.json.JsonSlurper().parseText(p)
+  return toPlain(p) // plain Map/List
 }
 
 @NonCPS
 def toPlain(Object obj) {
-  if (obj instanceof Map) {
-    def m = [:]
-    obj.each { key, value -> m[key?.toString()] = toPlain(value) }
-    return m
-  } else if (obj instanceof List) {
-    return obj.collect { toPlain(it) }
-  } else {
-    return obj
-  }
+  if (obj instanceof Map)  { def m = [:]; obj.each { k,v -> m[k?.toString()] = toPlain(v) }; return m }
+  if (obj instanceof List) { return obj.collect { toPlain(it) } }
+  return obj
 }
