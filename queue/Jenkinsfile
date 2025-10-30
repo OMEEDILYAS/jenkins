@@ -38,11 +38,10 @@ pipeline {
           echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
           echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
 
-          // Write queue files on master workspace
-          writeFile file: 'queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
-          writeFile file: 'queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
+          // Write a single queue file on master workspace (all jobs). Workers will filter by env.
+          writeFile file: 'queue.json', text: groovy.json.JsonOutput.toJson(incoming.jobs)
 
-          // Make them available to all matrix workers
+          // Make it available to all matrix workers
           stash name: 'queues', includes: 'queue.json'
         }
       }
@@ -71,10 +70,14 @@ pipeline {
           stage('Live worker') {
             steps {
               script {
-                // Bring queue files into this agent workspace
+                // Bring queue file into this agent workspace
                 unstash 'queues'
 
-                def allLive = parsePlainSafe(readFile('queue.json')) as List
+                def all = parsePlainSafe(readFile('queue.json')) as List
+                // Filter only live jobs
+                def allLive = (all ?: []).findAll { j ->
+                  (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'live' }
+                }
 
                 // Shard jobs by agent (round-robin by index)
                 int shards = 4
@@ -126,10 +129,14 @@ pipeline {
           stage('Staging worker') {
             steps {
               script {
-                // Bring queue files into this agent workspace
+                // Bring queue file into this agent workspace
                 unstash 'queues'
 
-                def allStaging = parsePlainSafe(readFile('queue.json')) as List
+                def all = parsePlainSafe(readFile('queue.json')) as List
+                // Filter only staging jobs
+                def allStaging = (all ?: []).findAll { j ->
+                  (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'staging' }
+                }
 
                 int shards = 4
                 int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
