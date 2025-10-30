@@ -7,53 +7,106 @@ pipeline {
   environment { BUILD_TRIGGER_BY = 'unknown' }
 
   stages {
-    stage('live run') {
+    /* ===== LIVE: matrix across agent-1..4 ===== */
+stage('live run') {
   when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
-  steps {
-    script {
-      def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
-      echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
-
-      // helper to convert parameters array -> Jenkins parameter list
-      def toParamList = { plist ->
-        (plist ?: []).collect { p ->
-          string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
-        }
+  matrix {
+    axes {
+      axis {
+        name 'AGENT_LABEL'
+        values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
       }
+    }
+    agent { label "${AGENT_LABEL}" }
 
-      // build each job individually
-      liveJobs.each { j ->
-        def target = j.job?.toString()
-        if (!target) { error "Live job '${j.name}' is missing a 'job' field." }
-        echo "Starting live run: ${j.name} -> ${target}"
-        build job: target, wait: true, parameters: toParamList(j.parameters)
+    stages {
+      stage('Live worker') {
+        steps {
+          script {
+            // Parse once, then shard by agent
+            def allLive = parsePlainSafe(readFile('live_queue.json')) as List
+
+            // Map each agent label to an index 0..3 for sharding
+            def shardIndex = ['agent-1':0, 'agent-2':1, 'agent-3':2, 'agent-4':3][env.AGENT_LABEL] as int
+            int shards = 4
+
+            // Take only the jobs for this shard
+            def myJobs = []
+            allLive.eachWithIndex { j, i ->
+              if ((i % shards) == shardIndex) { myJobs << j }
+            }
+
+            echo "[${env.AGENT_LABEL}] live shard size=${myJobs.size()} of total=${allLive.size()}"
+            echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
+
+            // Helper to convert params to Jenkins parameter list
+            def toParamList = { plist ->
+              (plist ?: []).collect { p ->
+                string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+              }
+            }
+
+            myJobs.each { j ->
+              def target = j.job?.toString()
+              if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
+              echo "[${env.AGENT_LABEL}] ▶ live: ${j.name} -> ${target}"
+              build job: target, wait: true, parameters: toParamList(j.parameters)
+            }
+          }
+        }
       }
     }
   }
 }
 
+/* ===== STAGING: matrix across agent-1..4 ===== */
 stage('staging run') {
   when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
-  steps {
-    script {
-      def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
-      echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
-
-      def toParamList = { plist ->
-        (plist ?: []).collect { p ->
-          string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
-        }
+  matrix {
+    axes {
+      axis {
+        name 'AGENT_LABEL'
+        values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
       }
+    }
+    agent { label "${AGENT_LABEL}" }
 
-      stagingJobs.each { j ->
-        def target = j.job?.toString()
-        if (!target) { error "Staging job '${j.name}' is missing a 'job' field." }
-        echo "Starting staging run: ${j.name} -> ${target}"
-        build job: target, wait: true, parameters: toParamList(j.parameters)
+    stages {
+      stage('Staging worker') {
+        steps {
+          script {
+            def allStaging = parsePlainSafe(readFile('staging_queue.json')) as List
+
+            def shardIndex = ['agent-1':0, 'agent-2':1, 'agent-3':2, 'agent-4':3][env.AGENT_LABEL] as int
+            int shards = 4
+
+            def myJobs = []
+            allStaging.eachWithIndex { j, i ->
+              if ((i % shards) == shardIndex) { myJobs << j }
+            }
+
+            echo "[${env.AGENT_LABEL}] staging shard size=${myJobs.size()} of total=${allStaging.size()}"
+            echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
+
+            def toParamList = { plist ->
+              (plist ?: []).collect { p ->
+                string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+              }
+            }
+
+            myJobs.each { j ->
+              def target = j.job?.toString()
+              if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
+              echo "[${env.AGENT_LABEL}] ▶ staging: ${j.name} -> ${target}"
+              build job: target, wait: true, parameters: toParamList(j.parameters)
+            }
+          }
+        }
       }
     }
   }
 }
+
   }
 }
 
