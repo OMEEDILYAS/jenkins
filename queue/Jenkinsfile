@@ -7,62 +7,53 @@ pipeline {
   environment { BUILD_TRIGGER_BY = 'unknown' }
 
   stages {
-    stage('prep') {
-      steps {
-        script {
-          if (!params.ListOfJobs?.trim()) {
-            error 'ListOfJobs is empty; expected JSON payload from upstream.'
-          }
-
-          def incomingJobs = parseJobsToPlain(params.ListOfJobs)
-
-          def stagingJobs = incomingJobs.jobs.findAll { job ->
-            (job.parameters ?: []).find { p -> p.name == 'env' && p.value?.toString()?.toLowerCase() == 'staging' }
-          }
-          def liveJobs = incomingJobs.jobs.findAll { job ->
-            (job.parameters ?: []).find { p -> p.name == 'env' && p.value?.toString()?.toLowerCase() == 'live' }
-          }
-          // new breanch
-
-          echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
-          echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
-
-          writeFile file: 'live_queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
-          writeFile file: 'staging_queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
-        }
-      }
-    }
-
     stage('live run') {
-      when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
-      steps {
-        script {
-          // ✅ Parse via NonCPS helper (returns plain List/Map), not JsonSlurper here
-          def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
-          echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
-          echo "Starting live run for ${liveJobs}"
-          build job: liveJobs.job, wait: true, parameters: liveJobs.parameters.collect {
-            string(name: it.name, value: it.value.toString())
-          }
+  when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
+  steps {
+    script {
+      def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
+      echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
 
+      // helper to convert parameters array -> Jenkins parameter list
+      def toParamList = { plist ->
+        (plist ?: []).collect { p ->
+          string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
         }
       }
-    }
 
-    stage('staging run') {
-      when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
-      steps {
-        script {
-          // ✅ Parse via NonCPS helper
-          def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
-          echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
-          echo "Starting staging run for ${stagingJobs}"
-          build job: stagingJobs.job, wait: true, parameters: stagingJobs.parameters.collect {
-            string(name: it.name, value: it.value.toString())
-          }
-        }
+      // build each job individually
+      liveJobs.each { j ->
+        def target = j.job?.toString()
+        if (!target) { error "Live job '${j.name}' is missing a 'job' field." }
+        echo "Starting live run: ${j.name} -> ${target}"
+        build job: target, wait: true, parameters: toParamList(j.parameters)
       }
     }
+  }
+}
+
+stage('staging run') {
+  when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
+  steps {
+    script {
+      def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
+      echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
+
+      def toParamList = { plist ->
+        (plist ?: []).collect { p ->
+          string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+        }
+      }
+
+      stagingJobs.each { j ->
+        def target = j.job?.toString()
+        if (!target) { error "Staging job '${j.name}' is missing a 'job' field." }
+        echo "Starting staging run: ${j.name} -> ${target}"
+        build job: target, wait: true, parameters: toParamList(j.parameters)
+      }
+    }
+  }
+}
   }
 }
 
