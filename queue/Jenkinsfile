@@ -1,56 +1,157 @@
 pipeline {
-  agent { label 'master' }
+  agent { label 'master' }   // Orchestrate on master/controller
+
   parameters {
-    string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON')
+    string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON payload: { "jobs": [...] } or bare array')
   }
-  options { buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30')) }
-  environment { BUILD_TRIGGER_BY = 'unknown' }
+
+  options {
+    timestamps()
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
+  }
+
+  environment {
+    BUILD_TRIGGER_BY = 'unknown' // avoid calling methods in environment{}
+  }
 
   stages {
-    /* ===== LIVE: matrix across agent-1..4 ===== */
-stage('live run') {
-  when { expression { fileExists('live_queue.json') && readFile('live_queue.json')?.trim() && readFile('live_queue.json').trim() != '[]' } }
-  matrix {
-    axes {
-      axis {
-        name 'AGENT_LABEL'
-        values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
+
+    stage('prep') {
+      steps {
+        script {
+          if (!params.ListOfJobs?.trim()) {
+            error 'ListOfJobs is empty; expected JSON payload from upstream.'
+          }
+
+          // Parse into plain Maps/Lists (CPS-safe)
+          def incoming = parseJobsToPlain(params.ListOfJobs)
+
+          // Split by env
+          def liveJobs = incoming.jobs.findAll { j ->
+            (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'live' }
+          }
+          def stagingJobs = incoming.jobs.findAll { j ->
+            (j.parameters ?: []).any { p -> p?.name == 'env' && "${p?.value}".toLowerCase() == 'staging' }
+          }
+
+          echo "Live jobs: ${liveJobs.collect { it.name ?: it.job }}"
+          echo "Staging jobs: ${stagingJobs.collect { it.name ?: it.job }}"
+
+          // Write queue files on master workspace
+          writeFile file: 'live_queue.json',    text: groovy.json.JsonOutput.toJson(liveJobs)
+          writeFile file: 'staging_queue.json', text: groovy.json.JsonOutput.toJson(stagingJobs)
+
+          // Make them available to all matrix workers
+          stash name: 'queues', includes: 'live_queue.json, staging_queue.json'
+        }
       }
     }
-    agent { label "${AGENT_LABEL}" }
 
-    stages {
-      stage('Live worker') {
-        steps {
-          script {
-            // Parse once, then shard by agent
-            def allLive = parsePlainSafe(readFile('live_queue.json')) as List
+    /* ====================== LIVE: matrix across agents ====================== */
+    stage('live run') {
+      // Gate by content on master workspace (files exist & not empty array)
+      when {
+        expression {
+          fileExists('live_queue.json') &&
+          readFile('live_queue.json')?.trim() &&
+          readFile('live_queue.json').trim() != '[]'
+        }
+      }
+      matrix {
+        axes {
+          axis {
+            name 'AGENT_LABEL'
+            values 'agent-1','agent-2','agent-3','agent-4'
+          }
+        }
+        agent { label "${AGENT_LABEL}" }
 
-            // Map each agent label to an index 0..3 for sharding
-            def shardIndex = ['agent-1':0, 'agent-2':1, 'agent-3':2, 'agent-4':3][env.AGENT_LABEL] as int
-            int shards = 4
+        stages {
+          stage('Live worker') {
+            steps {
+              script {
+                // Bring queue files into this agent workspace
+                unstash 'queues'
 
-            // Take only the jobs for this shard
-            def myJobs = []
-            allLive.eachWithIndex { j, i ->
-              if ((i % shards) == shardIndex) { myJobs << j }
-            }
+                def allLive = parsePlainSafe(readFile('live_queue.json')) as List
 
-            echo "[${env.AGENT_LABEL}] live shard size=${myJobs.size()} of total=${allLive.size()}"
-            echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
+                // Shard jobs by agent (round-robin by index)
+                int shards = 4
+                int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
+                def myJobs = []
+                allLive.eachWithIndex { j, i -> if ((i % shards) == shardIndex) myJobs << j }
 
-            // Helper to convert params to Jenkins parameter list
-            def toParamList = { plist ->
-              (plist ?: []).collect { p ->
-                string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+                echo "[${env.AGENT_LABEL}] live shard size=${myJobs.size()} of total=${allLive.size()}"
+                echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
+
+                def toParamList = { plist ->
+                  (plist ?: []).collect { p ->
+                    string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+                  }
+                }
+
+                myJobs.each { j ->
+                  def target = j.job?.toString()
+                  if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
+                  echo "[${env.AGENT_LABEL}] ▶ live: ${j.name} -> ${target}"
+                  build job: target, wait: true, parameters: toParamList(j.parameters)
+                }
               }
             }
+          }
+        }
+      }
+    }
 
-            myJobs.each { j ->
-              def target = j.job?.toString()
-              if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
-              echo "[${env.AGENT_LABEL}] ▶ live: ${j.name} -> ${target}"
-              build job: target, wait: true, parameters: toParamList(j.parameters)
+    /* ==================== STAGING: matrix across agents ==================== */
+    stage('staging run') {
+      when {
+        expression {
+          fileExists('staging_queue.json') &&
+          readFile('staging_queue.json')?.trim() &&
+          readFile('staging_queue.json').trim() != '[]'
+        }
+      }
+      matrix {
+        axes {
+          axis {
+            name 'AGENT_LABEL'
+            values 'agent-1','agent-2','agent-3','agent-4'
+          }
+        }
+        agent { label "${AGENT_LABEL}" }
+
+        stages {
+          stage('Staging worker') {
+            steps {
+              script {
+                // Bring queue files into this agent workspace
+                unstash 'queues'
+
+                def allStaging = parsePlainSafe(readFile('staging_queue.json')) as List
+
+                int shards = 4
+                int shardIndex = ['agent-1':0,'agent-2':1,'agent-3':2,'agent-4':3][env.AGENT_LABEL] as int
+                def myJobs = []
+                allStaging.eachWithIndex { j, i -> if ((i % shards) == shardIndex) myJobs << j }
+
+                echo "[${env.AGENT_LABEL}] staging shard size=${myJobs.size()} of total=${allStaging.size()}"
+                echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
+
+                def toParamList = { plist ->
+                  (plist ?: []).collect { p ->
+                    string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
+                  }
+                }
+
+                myJobs.each { j ->
+                  def target = j.job?.toString()
+                  if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
+                  echo "[${env.AGENT_LABEL}] ▶ staging: ${j.name} -> ${target}"
+                  build job: target, wait: true, parameters: toParamList(j.parameters)
+                }
+              }
             }
           }
         }
@@ -59,67 +160,17 @@ stage('live run') {
   }
 }
 
-/* ===== STAGING: matrix across agent-1..4 ===== */
-stage('staging run') {
-  when { expression { fileExists('staging_queue.json') && readFile('staging_queue.json')?.trim() && readFile('staging_queue.json').trim() != '[]' } }
-  matrix {
-    axes {
-      axis {
-        name 'AGENT_LABEL'
-        values 'agent-1', 'agent-2', 'agent-3', 'agent-4'
-      }
-    }
-    agent { label "${AGENT_LABEL}" }
+/* ====================== Helpers (no plugins; CPS-safe) ====================== */
 
-    stages {
-      stage('Staging worker') {
-        steps {
-          script {
-            def allStaging = parsePlainSafe(readFile('staging_queue.json')) as List
-
-            def shardIndex = ['agent-1':0, 'agent-2':1, 'agent-3':2, 'agent-4':3][env.AGENT_LABEL] as int
-            int shards = 4
-
-            def myJobs = []
-            allStaging.eachWithIndex { j, i ->
-              if ((i % shards) == shardIndex) { myJobs << j }
-            }
-
-            echo "[${env.AGENT_LABEL}] staging shard size=${myJobs.size()} of total=${allStaging.size()}"
-            echo "[${env.AGENT_LABEL}] jobs: ${myJobs.collect { it.name ?: it.job }.join(', ')}"
-
-            def toParamList = { plist ->
-              (plist ?: []).collect { p ->
-                string(name: p.name.toString(), value: (p.value == null ? '' : p.value.toString()))
-              }
-            }
-
-            myJobs.each { j ->
-              def target = j.job?.toString()
-              if (!target) { error "[${env.AGENT_LABEL}] Job '${j.name}' missing 'job' field." }
-              echo "[${env.AGENT_LABEL}] ▶ staging: ${j.name} -> ${target}"
-              build job: target, wait: true, parameters: toParamList(j.parameters)
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-  }
-}
-
-/* ---- Helpers (no plugins, CPS-safe) ---- */
 @NonCPS
 def parseJobsToPlain(String raw) {
   def slurper = new groovy.json.JsonSlurper()
   Object obj = slurper.parseText(raw?.trim())
-  if (obj instanceof String) obj = slurper.parseText(obj) // handle double-encoded
+  if (obj instanceof String) obj = slurper.parseText(obj)   // handle double-encoded
   if (obj instanceof List) obj = [jobs: obj]
   else if (!(obj instanceof Map) || !(obj.jobs instanceof List))
     throw new Exception('Expected top-level {"jobs":[...]} or bare array.')
-  return toPlain(obj) // plain Map/List
+  return toPlain(obj)
 }
 
 @NonCPS
@@ -127,12 +178,12 @@ def parsePlainSafe(String jsonText) {
   if (!jsonText) return null
   def p = new groovy.json.JsonSlurper().parseText(jsonText.trim())
   if (p instanceof String) p = new groovy.json.JsonSlurper().parseText(p)
-  return toPlain(p) // plain Map/List
+  return toPlain(p)
 }
 
 @NonCPS
-def toPlain(Object obj) {
-  if (obj instanceof Map)  { def m = [:]; obj.each { k,v -> m[k?.toString()] = toPlain(v) }; return m }
-  if (obj instanceof List) { return obj.collect { toPlain(it) } }
-  return obj
+def toPlain(Object o) {
+  if (o instanceof Map)  { def m = [:]; o.each { k,v -> m[(k?.toString())] = toPlain(v) }; return m }
+  if (o instanceof List) { return o.collect { toPlain(it) } }
+  return o
 }
