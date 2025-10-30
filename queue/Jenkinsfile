@@ -41,6 +41,10 @@ pipeline {
           def liveJobs = parsePlainSafe(readFile('live_queue.json')) as List
           echo "n: ${liveJobs.collect { it.name ?: it.job }.join(', ')}"
           echo "Starting live run for ${liveJobs}"
+          build job: liveJobs.job, wait: true, parameters: liveJobs.parameters.collect {
+            string(name: it.name, value: it.value.toString())
+          }
+
         }
       }
     }
@@ -53,6 +57,9 @@ pipeline {
           def stagingJobs = parsePlainSafe(readFile('staging_queue.json')) as List
           echo "n: ${stagingJobs.collect { it.name ?: it.job }.join(', ')}"
           echo "Starting staging run for ${stagingJobs}"
+          build job: stagingJobs.job, wait: true, parameters: stagingJobs.parameters.collect {
+            string(name: it.name, value: it.value.toString())
+          }
         }
       }
     }
