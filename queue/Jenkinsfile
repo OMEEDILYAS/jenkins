@@ -37,6 +37,10 @@ pipeline {
             if (!(cur.jobs instanceof List))       cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
+            // 🔒 Harden existing queue content (remove nulls / non-maps / items missing job)
+            cur.jobs = (cur.jobs as List).findAll { it instanceof Map && it.job != null }
+
+
             // 2) Parse incoming
             def incoming = parseJobsToPlain(params.ListOfJobs) // returns [jobs: [...]]
             def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
@@ -78,13 +82,15 @@ pipeline {
             }
 
             // Optional: keep a light sort (priority desc, then FIFO by receivedAt)
-            (cur.jobs as List).sort { a, b ->
-              def pa = (a.priority ?: 0) as int
-              def pb = (b.priority ?: 0) as int
+            (cur.jobs as List).sort { x, y ->
+              def a = (x instanceof Map) ? x : [:]
+              def b = (y instanceof Map) ? y : [:]
+              int pa = (a.priority ?: 0) as int
+              int pb = (b.priority ?: 0) as int
               def byPrio = (pb <=> pa)
-              if (byPrio != 0) return byPrio
-              (a.receivedAt ?: '') <=> (b.receivedAt ?: '')
+              return (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
             }
+
 
             // 4) Write back pretty JSON
             def outText = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
