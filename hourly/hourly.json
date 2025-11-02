@@ -4,7 +4,7 @@
                         "name": "twenty",
                         "category": "hourly",
                         "priority": 8,
-                        "job": "optimized/queue",
+                        "job": "main",
                         "parameters": [
                             { "name": "PARAM1", "value": "cinnamon-breeze-42" },
                             { "name": "PARAM2", "value": "marble-sunset-7" },
@@ -16,7 +16,7 @@
                         "name": "twentyone",
                         "category": "hourly",
                         "priority": 8,
-                        "job": "optimized/queue",
+                        "job": "main",
                         "parameters": [
                             { "name": "PARAM1", "value": "ocean-whisper-101" },
                             { "name": "PARAM2", "value": "paper-lantern-202" },
@@ -28,7 +28,7 @@
                         "name": "twentytwo",
                         "category": "hourly",
                         "priority": 8,
-                        "job": "optimized/queue",
+                        "job": "main",
                         "parameters": [
                             { "name": "PARAM1", "value": "quartz-meadow-55" },
                             { "name": "PARAM2", "value": "ember-field-66" },
@@ -40,7 +40,7 @@
                         "name": "twentythree",
                         "category": "hourly",
                         "priority": 8,
-                        "job": "optimized/queue",
+                        "job": "main",
                         "parameters": [
                             { "name": "PARAM1", "value": "maple-accordion-1" },
                             { "name": "PARAM2", "value": "cobalt-waltz-2" },
@@ -52,7 +52,7 @@
                         "name": "twentyfour",
                         "category": "hourly",
                         "priority": 8,
-                        "job": "optimized/queue",
+                        "job": "main",
                         "parameters": [
                             { "name": "PARAM1", "value": "jade-spiral-A" },
                             { "name": "PARAM2", "value": "cerulean-tide-B" },

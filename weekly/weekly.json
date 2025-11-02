@@ -4,7 +4,7 @@
                     "name": "thirty",
                     "category": "weekly",
                     "priority": 4,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "rainbow" },
                         { "name": "PARAM2", "value": "mountain" },
@@ -16,7 +16,7 @@
                     "name": "thirtyone",
                     "category": "weekly",
                     "priority": 4,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "guitar" },
                         { "name": "PARAM2", "value": "piano" },
@@ -28,7 +28,7 @@
                     "name": "thirtytwo",
                     "category": "weekly",
                     "priority": 4,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "elephant" },
                         { "name": "PARAM2", "value": "giraffe" },
@@ -40,7 +40,7 @@
                     "name": "thirtythree",
                     "category": "weekly",
                     "priority": 4,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "computer" },
                         { "name": "PARAM2", "value": "keyboard" },
@@ -52,7 +52,7 @@
                     "name": "thirtyfour",
                     "category": "weekly",
                     "priority": 4,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "castle" },
                         { "name": "PARAM2", "value": "bridge" },
