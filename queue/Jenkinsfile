@@ -77,6 +77,8 @@ pipeline {
 
             writeFile file: env.QUEUE_PATH,
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+            // keep queue.json available to any workspace
+            stash name: 'queue-snapshot', includes: 'queue.json'
 
             echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
             echo "Current jobs: " + (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
@@ -90,6 +92,9 @@ pipeline {
       steps {
         script {
           lock(resource: 'queue-json') {
+            // always operate on the latest queue copy in *this* workspace
+            unstash 'queue-snapshot'
+
             def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
             if (!(cur.jobs instanceof List))       cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
@@ -165,6 +170,10 @@ pipeline {
             stash name: 'live-claims',    includes: 'live_claims.json',    allowEmpty: true
             stash name: 'staging-claims', includes: 'staging_claims.json', allowEmpty: true
 
+            // publish the updated queue for other branches
+            stash name: 'queue-snapshot', includes: 'queue.json'
+
+
             echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
 
 
@@ -221,6 +230,9 @@ pipeline {
                 // finalize on master
                 node('master') {
                   lock(resource: 'queue-json') {
+                    // NEW: ensure we work with the latest shared queue.json
+                    unstash 'queue-snapshot'
+
                     def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
                     if (!(cur.jobs instanceof List))       cur.jobs = []
                     if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
@@ -252,9 +264,11 @@ pipeline {
                         }
                       }
                       writeFile file: env.QUEUE_PATH,
-                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                              text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      // NEW: restash updated queue.json for other workspaces
+                      stash name: 'queue-snapshot', includes: 'queue.json'
                     } else {
-                      echo "[${env.AGENT_LABEL}] WARN: Claimed LIVE item not found during finalize."
+                      echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
                     }
                   } // lock
                 } // node master
@@ -312,6 +326,9 @@ pipeline {
                 // finalize on master
                 node('master') {
                   lock(resource: 'queue-json') {
+                    // NEW: ensure we work with the latest shared queue.json
+                    unstash 'queue-snapshot'
+
                     def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
                     if (!(cur.jobs instanceof List))       cur.jobs = []
                     if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
@@ -343,9 +360,11 @@ pipeline {
                         }
                       }
                       writeFile file: env.QUEUE_PATH,
-                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                              text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      // NEW: restash updated queue.json for other workspaces
+                      stash name: 'queue-snapshot', includes: 'queue.json'
                     } else {
-                      echo "[${env.AGENT_LABEL}] WARN: Claimed STAGING item not found during finalize."
+                      echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
                     }
                   } // lock
                 } // node master
