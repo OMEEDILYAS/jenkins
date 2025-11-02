@@ -16,16 +16,6 @@ pipeline {
   }
 
   stages {
-
-    stage('PURGE QUEUE - RUN ONCE') {
-      steps {
-        script {
-          writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-          echo "queue.json reset."
-        }
-      }
-    }
-
     stage('Ingest to queue.json') {
       steps {
         script {
