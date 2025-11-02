@@ -17,9 +17,6 @@ pipeline {
 
   stages {
 
-     --------------------------------
-     * Purge helper (run once then delete)
-     * --------------------------------
     stage('PURGE QUEUE - RUN ONCE') {
       steps {
         script {
