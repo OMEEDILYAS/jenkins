@@ -432,19 +432,17 @@ pipeline {
     }
   } // stages
   post {
-  always {
-    script {
-      if (fileExists(env.QUEUE_PATH)) {
-        def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
-        echo "Final queue: queued=${cur.jobs.count{ it.status=='queued' }}, running=${cur.jobs.count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List).size()}"
-        echo "Remaining jobs: " + (cur.jobs as List).collect{ it.name ?: it.job }.join(', ')
+    always {
+      script {
+        if (fileExists(env.QUEUE_PATH)) {
+          def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
+          echo "Final queue: queued=${cur.jobs.count{ it.status=='queued' }}, running=${cur.jobs.count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List).size()}"
+          echo "Remaining jobs: " + (cur.jobs as List).collect{ it.name ?: it.job }.join(', ')
+        }
       }
     }
   }
 }
-
-}
-
 /* ----------------------- Helpers (CPS-safe) ----------------------- */
 
 @NonCPS
