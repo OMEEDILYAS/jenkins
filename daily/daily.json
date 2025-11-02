@@ -3,61 +3,59 @@
     {
       "name": "one",
       "category": "daily",
-      //"priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "alpha" },
         { "name": "PARAM2", "value": "beta" },
         { "name": "PARAM3", "value": "gamma" }
-        //{ "name": "env", "value": "live" }
       ]
     },
     {
       "name": "two",
       "category": "daily",
-      //"priority": 6,
+      "priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "x" },
         { "name": "PARAM2", "value": "y" },
-        { "name": "PARAM3", "value": "z" }
-        //{ "name": "env", "value": "live" }
+        { "name": "PARAM3", "value": "z" },
+        { "name": "env", "value": "live" }
       ]
     },
     {
       "name": "three",
       "category": "daily",
-      //"priority": 6,
+      "priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "red" },
         { "name": "PARAM2", "value": "blue" },
-        { "name": "PARAM3", "value": "green" }
-        //{ "name": "env", "value": "live" }
+        { "name": "PARAM3", "value": "green" },
+        { "name": "env", "value": "live" }
       ]
     },
     {
       "name": "four",
       "category": "daily",
-      //"priority": 6,
+      "priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "one" },
         { "name": "PARAM2", "value": "two" },
-        { "name": "PARAM3", "value": "three" }
-        //{ "name": "env", "value": "live" }
+        { "name": "PARAM3", "value": "three" },
+        { "name": "env", "value": "live" }
       ]
     },
     {
       "name": "five",
       "category": "daily",
-      //"priority": 6,
+      "priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "spring" },
         { "name": "PARAM2", "value": "summer" },
-        { "name": "PARAM3", "value": "autumn" }
-        //{ "name": "env", "value": "live" }
+        { "name": "PARAM3", "value": "autumn" },
+        { "name": "env", "value": "live" }
       ]
     }
   ]
