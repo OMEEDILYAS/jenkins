@@ -2,33 +2,21 @@ pipeline {
   agent { label 'master' }
 
   parameters {
-    // Initial batch (optional). You can still pass ListOfJobs like before.
     string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON payload ({"jobs":[...]})')
-
-    // Optional maintenance ops
     booleanParam(name: 'PURGE_QUEUE',        defaultValue: false, description: 'Wipe queue.json (fresh start)')
     booleanParam(name: 'PURGE_DEADLETTER',   defaultValue: false, description: 'Clear deadLetter only')
     booleanParam(name: 'REQUEUE_DEADLETTER', defaultValue: false, description: 'Move deadLetter -> jobs (attempts=0)')
-
-    // Pool limits (per claim)
     string(name: 'LIVE_MAX',    defaultValue: '4', description: 'Max live claims per cycle (matrix fanout hint)')
     string(name: 'STAGING_MAX', defaultValue: '4', description: 'Max staging claims per cycle (matrix fanout hint)')
-
-    // Long-running behavior: workers will keep pulling work until idle timer expires.
     string(name: 'IDLE_WAIT_SECS', defaultValue: '10', description: 'Sleep seconds when no work found for a worker')
     string(name: 'IDLE_CYCLES',    defaultValue: '36', description: 'How many idle sleeps before a worker exits')
-
-    // Optional “dropbox” file path for streaming new jobs while the pipeline is running.
-    // Example: C:/ProgramData/Jenkins/.jenkins/queue_incoming.json  or  ${JENKINS_HOME}/queue_incoming.json
     string(name: 'POLL_INGRESS_FILE', defaultValue: '', description: 'If set, workers will ingest this file ({"jobs":[...]}) periodically')
   }
 
   options {
-    // NOTE: If you want *truly* always-on ingestion from multiple upstream triggers of this same job,
-    // remove disableConcurrentBuilds(). The locks below keep queue.json safe under concurrency.
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '40', daysToKeepStr: '45'))
-    // disableConcurrentBuilds()
+    // disableConcurrentBuilds()  // keep concurrent possible; locking protects queue.json
   }
 
   environment {
@@ -42,10 +30,7 @@ pipeline {
       steps {
         script {
           lock(resource: 'queue-json') {
-            def cur = [jobs: [], deadLetter: []]
-            if (fileExists(env.QUEUE_PATH)) {
-              cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: cur
-            }
+            def cur = ensureQueueShape(fileExists(env.QUEUE_PATH) ? parsePlainSafe(readFile(env.QUEUE_PATH)) : null)
             if (params.PURGE_QUEUE) {
               cur.jobs = []
               cur.deadLetter = []
@@ -69,10 +54,8 @@ pipeline {
             if (!fileExists(env.QUEUE_PATH)) {
               writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
             }
-            def cur    = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
+            def cur    = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
             def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-            cur.jobs         = sanitizeJobs(cur.jobs)
-            cur.deadLetter   = (cur.deadLetter instanceof List) ? cur.deadLetter : []
             int moved = 0
             (cur.deadLetter as List).each { j ->
               def x = toPlain(j)
@@ -110,10 +93,7 @@ pipeline {
           }
 
           lock(resource: 'queue-json') {
-            def curText = readFile(env.QUEUE_PATH)
-            def cur     = parsePlainSafe(curText) ?: [jobs: [], deadLetter: []]
-            if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
-            cur.jobs = sanitizeJobs(cur.jobs)
+            def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
 
             def incoming = parseJobsToPlain(params.ListOfJobs) // -> [jobs:[...]]
             def nowIso   = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
@@ -122,7 +102,6 @@ pipeline {
             (incoming.jobs ?: []).each { j ->
               def item = toPlain(j) ?: [:]
               if (!(item.parameters instanceof List)) item.parameters = []
-              // ensure env in parameters; default to 'staging'
               def envParam = item.parameters.find { it?.name?.toString() == 'env' }
               def envValue = envParam?.value?.toString()?.toLowerCase()
               if (!envValue) {
@@ -145,7 +124,7 @@ pipeline {
 
             cur.jobs = sortJobs(cur.jobs)
 
-            // normalize legacy env param
+            // normalize env param on legacy entries
             cur.jobs.each { j ->
               if (!(j.parameters instanceof List)) j.parameters = []
               boolean hasEnv = j.parameters.any { (it?.name as String) == 'env' }
@@ -169,10 +148,7 @@ pipeline {
     stage('LIVE pool (matrix)') {
       matrix {
         axes {
-          axis {
-            name 'AGENT_LABEL'
-            values 'agent-1','agent-2','agent-3','agent-4'
-          }
+          axis { name 'AGENT_LABEL'; values 'agent-1','agent-2','agent-3','agent-4' }
         }
         agent { label "${AGENT_LABEL}" }
         stages {
@@ -182,9 +158,7 @@ pipeline {
                 int idleWait  = (params.IDLE_WAIT_SECS ?: '10') as int
                 int idleLeft  = (params.IDLE_CYCLES    ?: '36') as int
                 while (true) {
-                  // Optional: ingest streaming drop-file if provided
                   ingestDropfileIfPresent(params.POLL_INGRESS_FILE)
-
                   def claimKey = UUID.randomUUID().toString()
                   def item     = claimNext('live', claimKey)
 
@@ -194,7 +168,6 @@ pipeline {
                     break
                   }
 
-                  // Build params safely
                   def safeParams = (item?.parameters instanceof List) ? item.parameters : []
                   safeParams = safeParams.findAll { it instanceof Map && it.name != null }
                   def plist = safeParams.collect { kv ->
@@ -214,13 +187,13 @@ pipeline {
                     echo "[${env.AGENT_LABEL}] ✖ LIVE fail ${item.name ?: jobName}: ${err}"
                   }
                   finalizeOne(item, ok, err)
-                  idleLeft = (params.IDLE_CYCLES ?: '36') as int  // reset on successful or failed work
-                } // while
-              } // script
-            } // steps
-          } // stage
-        } // stages
-      } // matrix
+                  idleLeft = (params.IDLE_CYCLES ?: '36') as int
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     /* ---------------------- STAGING POOL ---------------------- */
@@ -228,10 +201,7 @@ pipeline {
     stage('STAGING pool (matrix)') {
       matrix {
         axes {
-          axis {
-            name 'AGENT_LABEL'
-            values 'staging-1','staging-2','staging-3','staging-4'
-          }
+          axis { name 'AGENT_LABEL'; values 'staging-1','staging-2','staging-3','staging-4' }
         }
         agent { label "${AGENT_LABEL}" }
         stages {
@@ -241,9 +211,7 @@ pipeline {
                 int idleWait  = (params.IDLE_WAIT_SECS ?: '10') as int
                 int idleLeft  = (params.IDLE_CYCLES    ?: '36') as int
                 while (true) {
-                  // Optional: ingest streaming drop-file if provided
                   ingestDropfileIfPresent(params.POLL_INGRESS_FILE)
-
                   def claimKey = UUID.randomUUID().toString()
                   def item     = claimNext('staging', claimKey)
 
@@ -273,12 +241,12 @@ pipeline {
                   }
                   finalizeOne(item, ok, err)
                   idleLeft = (params.IDLE_CYCLES ?: '36') as int
-                } // while
-              } // script
-            } // steps
-          } // stage
-        } // stages
-      } // matrix
+                }
+              }
+            }
+          }
+        }
+      }
     }
   } // stages
 
@@ -286,9 +254,8 @@ pipeline {
     always {
       script {
         if (fileExists(env.QUEUE_PATH)) {
-          def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
-          cur.jobs = sanitizeJobs(cur.jobs)
-          echo "Final queue: queued=${cur.jobs.count{ it.status=='queued' }}, running=${cur.jobs.count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List)?.size() ?: 0}"
+          def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
+          echo "Final queue: queued=${cur.jobs.count{ it.status=='queued' }}, running=${cur.jobs.count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List).size()}"
           echo "Remaining jobs: " + (cur.jobs as List).collect{ it.name ?: it.job }.join(', ')
         }
       }
@@ -329,6 +296,28 @@ def toPlain(Object o) {
   return o
 }
 
+/** Ensure we always have a {jobs:[], deadLetter:[]} map, no matter what was parsed. */
+@NonCPS
+def ensureQueueShape(Object parsed) {
+  def m
+  if (parsed instanceof Map) {
+    m = toPlain(parsed)
+  } else if (parsed instanceof List) {
+    m = [jobs: toPlain(parsed), deadLetter: []]
+  } else {
+    m = [jobs: [], deadLetter: []]
+  }
+  if (!(m.jobs instanceof List))       m.jobs = []
+  if (!(m.deadLetter instanceof List)) m.deadLetter = []
+  // make sure every job has a parameters list to avoid NPEs
+  m.jobs = m.jobs.findAll { it instanceof Map }.collect { j ->
+    def x = toPlain(j)
+    if (!(x.parameters instanceof List)) x.parameters = []
+    return x
+  }
+  return m
+}
+
 @NonCPS
 def sanitizeJobs(Object jobsObj) {
   def L = (jobsObj instanceof List) ? jobsObj : []
@@ -353,20 +342,14 @@ def sortJobs(List jobs) {
   return copy
 }
 
-/**
- * Atomically claim the next queued item for the given env ('live' | 'staging').
- * Marks job as running + sets claimId. Returns the claimed job Map or null.
- */
+/** Atomically claim the next queued item for given env ('live' | 'staging'). */
 def claimNext(String envName, String claimKey) {
   def claimed = null
   lock(resource: 'queue-json') {
     if (!fileExists(env.QUEUE_PATH)) {
       writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
     }
-    def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
-    if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
-
-    cur.jobs = sanitizeJobs(cur.jobs)
+    def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
 
     // normalize env on all entries
     cur.jobs.each { j ->
@@ -379,7 +362,6 @@ def claimNext(String envName, String claimKey) {
 
     cur.jobs = sortJobs(cur.jobs)
 
-    // find first queued for env
     int idx = -1
     for (int i=0; i<cur.jobs.size(); i++) {
       def j = cur.jobs[i]
@@ -397,26 +379,18 @@ def claimNext(String envName, String claimKey) {
                text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
       claimed = toPlain(item)
     }
-  } // lock
-
+  }
   return (claimed instanceof Map) ? claimed : null
 }
 
-/**
- * Finalize a single claimed item: remove on success, or requeue / deadletter on failure.
- */
+/** Finalize a single claimed item: remove on success, or requeue / deadletter on failure. */
 def finalizeOne(Object item, boolean ok, String errMsg) {
-  if (!(item instanceof Map)) {
-    echo "[finalizeOne] Skipping finalize: null/invalid item."
-    return
-  }
+  if (!(item instanceof Map)) { echo "[finalizeOne] Skipping finalize: null/invalid item."; return }
   lock(resource: 'queue-json') {
     if (!fileExists(env.QUEUE_PATH)) {
       writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
     }
-    def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
-    if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
-    cur.jobs = sanitizeJobs(cur.jobs)
+    def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
 
     int idx = (cur.jobs as List).findIndexOf { j ->
       (j?.status == 'running') &&
@@ -452,13 +426,10 @@ def finalizeOne(Object item, boolean ok, String errMsg) {
   }
 }
 
-/**
- * If POLL_INGRESS_FILE is set and contains {"jobs":[...]}, ingest it atomically and clear it.
- */
+/** If POLL_INGRESS_FILE is set and contains {"jobs":[...]}, ingest it atomically and clear it. */
 def ingestDropfileIfPresent(String path) {
   if (!path?.trim()) return
   lock(resource: 'queue-json') {
-    // read dropfile safely (ignore if missing or empty)
     def content = null
     try {
       if (fileExists(path)) {
@@ -468,7 +439,6 @@ def ingestDropfileIfPresent(String path) {
 
     if (!content) return
 
-    // parse incoming
     def incoming = null
     try {
       incoming = parseJobsToPlain(content) // -> [jobs:[...]]
@@ -480,10 +450,8 @@ def ingestDropfileIfPresent(String path) {
     if (!fileExists(env.QUEUE_PATH)) {
       writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
     }
-    def cur   = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
+    def cur    = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
     def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-    cur.jobs = sanitizeJobs(cur.jobs)
-    if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
     int added = 0
     (incoming.jobs ?: []).each { j ->
@@ -514,10 +482,7 @@ def ingestDropfileIfPresent(String path) {
              text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
 
     // clear the dropfile after successful ingest
-    try {
-      writeFile file: path, text: ''
-    } catch (ignored) {}
-
+    try { writeFile file: path, text: '' } catch (ignored) {}
     echo "[ingestDropfileIfPresent] Ingested ${added} new job(s) from ${path}."
   }
 }
