@@ -3,11 +3,13 @@
     {
       "name": "one",
       "category": "daily",
+      "priority": 6,
       "job": "main",
       "parameters": [
         { "name": "PARAM1", "value": "alpha" },
         { "name": "PARAM2", "value": "beta" },
-        { "name": "PARAM3", "value": "gamma" }
+        { "name": "PARAM3", "value": "gamma" },
+        { "name": "env", "value": "live" }
       ]
     },
     {
