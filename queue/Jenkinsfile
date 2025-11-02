@@ -33,13 +33,24 @@ pipeline {
           lock(resource: 'queue-json') {
             // 1) Read current queue
             def curText = readFile(env.QUEUE_PATH)
-            def cur = parsePlainSafe(curText) ?: [jobs: [], deadLetter: []]
+            def curRaw  = parsePlainSafe(curText)
+
+            // normalize the current queue to a Map with jobs/deadLetter
+            def cur
+            if (curRaw instanceof Map) {
+              cur = curRaw
+            } else if (curRaw instanceof List) {
+              // someone wrote a bare array in a previous run; wrap it
+              cur = [jobs: curRaw, deadLetter: []]
+            } else {
+              cur = [jobs: [], deadLetter: []]
+            }
+
             if (!(cur.jobs instanceof List))       cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
             // 🔒 Harden existing queue content (remove nulls / non-maps / items missing job)
             cur.jobs = (cur.jobs as List).findAll { it instanceof Map && it.job != null }
-
 
             // 2) Parse incoming
             def incoming = parseJobsToPlain(params.ListOfJobs) // returns [jobs: [...]]
@@ -83,15 +94,13 @@ pipeline {
 
             // Optional: keep a light sort (priority desc, then FIFO by receivedAt)
             (cur.jobs as List).sort { x, y ->
-              def a = (x instanceof Map) ? x : [:]
-              def b = (y instanceof Map) ? y : [:]
-              int pa = (a.priority ?: 0) as int
-              int pb = (b.priority ?: 0) as int
-              def byPrio = (pb <=> pa)
-              return (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
-            }
-
-
+            def a = (x instanceof Map) ? x : [:]
+            def b = (y instanceof Map) ? y : [:]
+            int pa = (a.priority ?: 0) as int
+            int pb = (b.priority ?: 0) as int
+            def byPrio = (pb <=> pa)
+            return (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
+          }
             // 4) Write back pretty JSON
             def outText = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
             writeFile file: env.QUEUE_PATH, text: outText
