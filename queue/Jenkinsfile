@@ -72,13 +72,6 @@ pipeline {
               item.env = envValue  // top-level copy for fast filtering later
               echo "Job '${item.name ?: item.job}' assigned to env='${item.env}'"
 
-              // Default priority if missing/invalid
-              def pr = null
-              try { pr = (item.priority as Integer) } catch (ignored) {}
-              if (pr == null) pr = 6           // <-- default per your rule
-              item.priority = pr
-              // echo the priority of the job that didn't have it set
-              echo "Job '${item.name ?: item.job}' assigned priority='${item.priority}'"
 
               // Ensure core fields
               item.status     = 'queued'
