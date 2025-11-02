@@ -15,6 +15,7 @@ pipeline {
   }
 
   stages {
+
     stage('Ingest to queue.json') {
       steps {
         script {
@@ -30,20 +31,20 @@ pipeline {
             def curText = readFile(env.QUEUE_PATH)
             def curRaw  = parsePlainSafe(curText)
 
-            // normalize current queue
+            // normalize existing queue to Map with jobs/deadLetter
             def cur
-            if (curRaw instanceof Map)      cur = curRaw
-            else if (curRaw instanceof List) cur = [jobs: curRaw, deadLetter: []]
-            else                             cur = [jobs: [],  deadLetter: []]
+            if (curRaw instanceof Map) { cur = curRaw }
+            else if (curRaw instanceof List) { cur = [jobs: curRaw, deadLetter: []] }
+            else { cur = [jobs: [], deadLetter: []] }
 
             if (!(cur.jobs instanceof List))       cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
-            // remove junk
+            // drop junk rows
             cur.jobs = (cur.jobs as List).findAll { it instanceof Map && it.job != null }
 
             // parse incoming
-            def incoming = parseJobsToPlain(params.ListOfJobs) // => [jobs:[...]]
+            def incoming = parseJobsToPlain(params.ListOfJobs) // -> [jobs:[...]]
             def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
 
             int added = 0
@@ -51,21 +52,20 @@ pipeline {
               def item = toPlain(j) ?: [:]
               if (!(item.parameters instanceof List)) item.parameters = []
 
-              // ensure env is inside parameters; default to staging if missing
+              // ensure env in parameters; default to 'staging' if missing
               def envParam = item.parameters.find { it?.name?.toString() == 'env' }
               def envValue = envParam?.value?.toString()?.toLowerCase()
               if (!envValue) {
                 envValue = 'staging'
                 item.parameters << [name: 'env', value: envValue]
               }
-              item.env = envValue // top-level copy for filtering later
+              item.env = envValue // top-level for quick filtering
 
-              // priority is assumed provided by upstream; if absent/malformed, keep null-safe 6
-              def pr = 6
-              try { pr = (item.priority as Integer) ?: 6 } catch (ignored) {}
-              item.priority  = pr
-              item.status    = 'queued'
-              item.attempts  = (item.attempts ?: 0) as int
+              // DO NOT override priority here; use upstream value if present
+              // (Sorting treats null/missing priority as 0.)
+
+              item.status     = 'queued'
+              item.attempts   = (item.attempts ?: 0) as int
               item.receivedAt = item.receivedAt ?: nowIso
 
               if (!item.job) {
@@ -87,8 +87,8 @@ pipeline {
               (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
             }
 
-            def outText = groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-            writeFile file: env.QUEUE_PATH, text: outText
+            writeFile file: env.QUEUE_PATH,
+                     text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
 
             echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
             def names = (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
@@ -101,17 +101,19 @@ pipeline {
     stage('Dispatch top 3') {
       steps {
         script {
-          // 1) Claim up to 3 queued items under lock
+          // 1) Claim up to 3 queued items (under lock)
           def claimed = []
           def claimId = UUID.randomUUID().toString()
+          def startedNow = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
 
           lock(resource: 'queue-json') {
             def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
             if (!(cur.jobs instanceof List))       cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+
             cur.jobs = (cur.jobs as List).findAll { it instanceof Map && it.job != null }
 
-            // ensure sorted
+            // ensure sorted again
             (cur.jobs as List).sort { x, y ->
               def a = (x instanceof Map) ? x : [:]
               def b = (y instanceof Map) ? y : [:]
@@ -125,15 +127,24 @@ pipeline {
             def queued = (cur.jobs as List).findAll { (it.status ?: 'queued') == 'queued' }
             claimed = queued.take(3).collect { toPlain(it) }
 
-            // mark running
-            claimed.each { it.status = 'running'; it.claimId = claimId; it.startedAt = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX") }
-
-            // write back with running status for claimed items
-            def updated = (cur.jobs as List).collect { j ->
-              def k = claimed.find { it.is(j) || (it.name == j.name && it.receivedAt == j.receivedAt && it.job == j.job) }
-              k ? k : j
+            // mark running IN-PLACE (avoid sandbox-blocked identity methods)
+            claimed.each { c ->
+              int idx = (cur.jobs as List).findIndexOf { j ->
+                (j?.job?.toString()        == c.job?.toString()) &&
+                ((j?.name?.toString() ?: '') == (c.name?.toString() ?: '')) &&
+                (j?.receivedAt?.toString() == c.receivedAt?.toString()) &&
+                ((j?.status ?: 'queued')   == 'queued')
+              }
+              if (idx >= 0) {
+                cur.jobs[idx].status    = 'running'
+                cur.jobs[idx].claimId   = claimId
+                cur.jobs[idx].startedAt = startedNow
+                // mirror on the claimed copy
+                c.status    = 'running'
+                c.claimId   = claimId
+                c.startedAt = startedNow
+              }
             }
-            cur.jobs = updated
 
             writeFile file: env.QUEUE_PATH,
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
@@ -146,7 +157,7 @@ pipeline {
 
           echo "Dispatching ${claimed.size()} job(s): ${claimed.collect { it.name ?: it.job }.join(', ')}"
 
-          // 2) Run each claimed job (sequentially for now)
+          // 2) Run each claimed job (sequential for now)
           claimed.each { item ->
             def jobName = item.job.toString()
             def plist   = (item.parameters ?: []).collect { kv ->
@@ -156,7 +167,7 @@ pipeline {
             boolean ok = true
             String err = null
             try {
-              echo "▶ Running ${item.name ?: jobName} -> ${jobName} (priority=${item.priority}, env=${item.env})"
+              echo "▶ Running ${item.name ?: jobName} -> ${jobName} (priority=${item.priority ?: 0}, env=${item.env})"
               build job: jobName, wait: true, propagate: true, parameters: plist
               echo "✔ Success ${item.name ?: jobName}"
             } catch (e) {
@@ -165,27 +176,24 @@ pipeline {
               echo "✖ Failure ${item.name ?: jobName}: ${err}"
             }
 
-            // 3) Finalize result under lock
+            // 3) Finalize under lock
             lock(resource: 'queue-json') {
               def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
               if (!(cur.jobs instanceof List))       cur.jobs = []
               if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
-              // find the running entry by claimId + name + job
-              int idx = (cur.jobs as List).findIndexOf {
-                (it?.status == 'running') &&
-                (it?.claimId?.toString() == item.claimId?.toString()) &&
-                (it?.job?.toString() == jobName) &&
-                ((it?.name?.toString() ?: '') == (item.name?.toString() ?: ''))
+              int idx = (cur.jobs as List).findIndexOf { j ->
+                (j?.status == 'running') &&
+                (j?.claimId?.toString()   == item.claimId?.toString()) &&
+                (j?.job?.toString()       == jobName) &&
+                ((j?.name?.toString() ?: '') == (item.name?.toString() ?: ''))
               }
 
               if (idx >= 0) {
                 def j = cur.jobs[idx]
                 if (ok) {
-                  // remove on success
-                  cur.jobs.remove(idx)
+                  cur.jobs.remove(idx) // success: remove
                 } else {
-                  // retry up to 3 attempts
                   int attempts = ((j.attempts ?: 0) as int) + 1
                   j.attempts = attempts
                   if (attempts >= 3) {
@@ -194,8 +202,8 @@ pipeline {
                     (cur.deadLetter as List) << j
                     cur.jobs.remove(idx)
                   } else {
-                    j.status   = 'queued'
-                    j.claimId  = null
+                    j.status    = 'queued'
+                    j.claimId   = null
                     j.startedAt = null
                     cur.jobs[idx] = j
                   }
@@ -204,10 +212,10 @@ pipeline {
                 writeFile file: env.QUEUE_PATH,
                          text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
               } else {
-                echo "WARN: Claimed item not found during finalize (already modified by another run?)."
+                echo "WARN: Claimed item not found during finalize (possibly updated by another run)."
               }
             } // lock finalize
-          } // each claimed
+          } // each
         } // script
       } // steps
     } // stage
@@ -223,7 +231,7 @@ def parseJobsToPlain(String raw) {
   try { obj = sl.parseText(raw?.trim()) } catch (e) {
     throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw?.take(200)}")
   }
-  if (obj instanceof String) obj = sl.parseText(obj) // double-encoded
+  if (obj instanceof String) obj = sl.parseText(obj) // handle double-encoded
   if (obj instanceof List)   obj = [jobs: obj]
   else if (!(obj instanceof Map) || !(obj.jobs instanceof List))
     throw new Exception('Expected top-level {"jobs":[...]} or a bare array.')
