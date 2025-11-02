@@ -8,8 +8,8 @@ pipeline {
     booleanParam(name: 'REQUEUE_DEADLETTER', defaultValue: false, description: 'Move deadLetter -> jobs (attempts=0)')
     string(name: 'LIVE_MAX',    defaultValue: '4', description: 'Max live claims per cycle (matrix fanout hint)')
     string(name: 'STAGING_MAX', defaultValue: '4', description: 'Max staging claims per cycle (matrix fanout hint)')
-    string(name: 'IDLE_WAIT_SECS', defaultValue: '10', description: 'Sleep seconds when no work found for a worker')
-    string(name: 'IDLE_CYCLES',    defaultValue: '36', description: 'How many idle sleeps before a worker exits')
+    string(name: 'IDLE_WAIT_SECS', defaultValue: '15', description: 'Sleep seconds when no work found for a worker')
+    string(name: 'IDLE_CYCLES',    defaultValue: '3', description: 'How many idle sleeps before a worker exits')
     string(name: 'POLL_INGRESS_FILE', defaultValue: '', description: 'If set, workers will ingest this file ({"jobs":[...]}) periodically')
   }
 
