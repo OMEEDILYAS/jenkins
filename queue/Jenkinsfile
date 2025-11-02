@@ -51,7 +51,7 @@ pipeline {
               }
               item.env = envValue
 
-              // keep upstream priority as-is; null treated as 0 for sorting
+              // leave upstream priority as-is; null treated as 0 for sorting
               item.status     = 'queued'
               item.attempts   = (item.attempts ?: 0) as int
               item.receivedAt = item.receivedAt ?: nowIso
@@ -65,7 +65,7 @@ pipeline {
               }
             }
 
-            // sort: priority desc, then FIFO
+            // sort: priority desc, then FIFO by receivedAt
             (cur.jobs as List).sort { x, y ->
               def a = (x instanceof Map) ? x : [:]
               def b = (y instanceof Map) ? y : [:]
@@ -74,15 +74,11 @@ pipeline {
               def byPrio = (pb <=> pa)
               (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
             }
-            
-            // normalize job parameters and ensure env=staging if missing
-            // (use the current queue object `cur`, not an undefined `queue` variable)
+
+            // normalize parameters list defensively; ensure env exists
             cur.jobs.each { j ->
               if (!(j.parameters instanceof List)) { j.parameters = [] }
-              boolean hasEnv = false
-              for (p in j.parameters) {
-                if ((p?.name as String) == 'env') { hasEnv = true; break }
-              }
+              boolean hasEnv = j.parameters.any { (it?.name as String) == 'env' }
               if (!hasEnv) {
                 j.parameters << [ name: 'env', value: 'staging' ]
               }
@@ -179,16 +175,12 @@ pipeline {
             writeFile file: 'staging_claims.json',
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(stagingClaims))
 
-            // NEW: stash them so agents can fetch copies
+            // stash them so agents can fetch copies
             stash name: 'live-claims',    includes: 'live_claims.json',    allowEmpty: true
             stash name: 'staging-claims', includes: 'staging_claims.json', allowEmpty: true
 
             // publish the updated queue for other branches
             stash name: 'queue-snapshot', includes: 'queue.json'
-
-
-            echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
-
 
             echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
           } // lock
@@ -214,9 +206,9 @@ pipeline {
           stage('Live worker') {
             steps {
               script {
-                unstash 'live-claims'   // NEW
+                unstash 'live-claims'
                 def claims = parsePlainSafe(readFile('live_claims.json')) as List
-                int myIndex = indexFromAgent(env.AGENT_LABEL) // agent-1->0, agent-2->1, ...
+                int myIndex = indexFromAgent(env.AGENT_LABEL) // 1->0, 2->1, ...
                 if (myIndex < 0 || myIndex >= claims.size()) {
                   echo "[${env.AGENT_LABEL}] No assigned live item; skipping."
                   return
@@ -227,11 +219,12 @@ pipeline {
                 def plist   = (item.parameters ?: []).collect { kv ->
                   string(name: kv.name.toString(), value: (kv.value == null ? '' : kv.value.toString()))
                 }
+                def envVal  = (item.parameters ?: []).find { (it?.name as String) == 'env' }?.value?.toString() ?: 'staging'
 
                 boolean ok = true
                 String err = null
                 try {
-                  echo "[${env.AGENT_LABEL}] ▶ LIVE ${item.name ?: jobName} (prio=${item.priority ?: 0})"
+                  echo "[${env.AGENT_LABEL}] ▶ LIVE ${item.name ?: jobName} (prio=${item.priority ?: 0}, env=${envVal})"
                   build job: jobName, wait: true, propagate: true, parameters: plist
                   echo "[${env.AGENT_LABEL}] ✔ LIVE done ${item.name ?: jobName}"
                 } catch (e) {
@@ -243,7 +236,7 @@ pipeline {
                 // finalize on master
                 node('master') {
                   lock(resource: 'queue-json') {
-                    // NEW: ensure we work with the latest shared queue.json
+                    // ensure we work with the latest shared queue.json
                     unstash 'queue-snapshot'
 
                     def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
@@ -277,8 +270,8 @@ pipeline {
                         }
                       }
                       writeFile file: env.QUEUE_PATH,
-                              text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-                      // NEW: restash updated queue.json for other workspaces
+                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      // restash updated queue.json for other workspaces
                       stash name: 'queue-snapshot', includes: 'queue.json'
                     } else {
                       echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
@@ -310,9 +303,9 @@ pipeline {
           stage('Staging worker') {
             steps {
               script {
-                unstash 'staging-claims'   // NEW
+                unstash 'staging-claims'
                 def claims = parsePlainSafe(readFile('staging_claims.json')) as List
-                int myIndex = indexFromAgent(env.AGENT_LABEL) // staging-1->0, ...
+                int myIndex = indexFromAgent(env.AGENT_LABEL) // 1->0, ...
                 if (myIndex < 0 || myIndex >= claims.size()) {
                   echo "[${env.AGENT_LABEL}] No assigned staging item; skipping."
                   return
@@ -323,11 +316,12 @@ pipeline {
                 def plist   = (item.parameters ?: []).collect { kv ->
                   string(name: kv.name.toString(), value: (kv.value == null ? '' : kv.value.toString()))
                 }
+                def envVal  = (item.parameters ?: []).find { (it?.name as String) == 'env' }?.value?.toString() ?: 'staging'
 
                 boolean ok = true
                 String err = null
                 try {
-                  echo "[${env.AGENT_LABEL}] ▶ STAGING ${item.name ?: jobName} (prio=${item.priority ?: 0})"
+                  echo "[${env.AGENT_LABEL}] ▶ STAGING ${item.name ?: jobName} (prio=${item.priority ?: 0}, env=${envVal})"
                   build job: jobName, wait: true, propagate: true, parameters: plist
                   echo "[${env.AGENT_LABEL}] ✔ STAGING done ${item.name ?: jobName}"
                 } catch (e) {
@@ -339,7 +333,7 @@ pipeline {
                 // finalize on master
                 node('master') {
                   lock(resource: 'queue-json') {
-                    // NEW: ensure we work with the latest shared queue.json
+                    // ensure we work with the latest shared queue.json
                     unstash 'queue-snapshot'
 
                     def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
@@ -373,8 +367,8 @@ pipeline {
                         }
                       }
                       writeFile file: env.QUEUE_PATH,
-                              text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-                      // NEW: restash updated queue.json for other workspaces
+                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      // restash updated queue.json for other workspaces
                       stash name: 'queue-snapshot', includes: 'queue.json'
                     } else {
                       echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
