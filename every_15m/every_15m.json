@@ -4,7 +4,7 @@
                     "name": "ten",
                     "category": "every_15m",
                     "priority": 10,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "coffee" },
                         { "name": "PARAM2", "value": "tea" },
@@ -16,7 +16,7 @@
                     "name": "eleven",
                     "category": "every_15m",
                     "priority": 10,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "cat" },
                         { "name": "PARAM2", "value": "dog" },
@@ -28,7 +28,7 @@
                     "name": "twelve",
                     "category": "every_15m",
                     "priority": 10,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "pizza" },
                         { "name": "PARAM2", "value": "pasta" },
@@ -40,7 +40,7 @@
                     "name": "thirteen",
                     "category": "every_15m",
                     "priority": 10,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "book" },
                         { "name": "PARAM2", "value": "pen" },
@@ -52,7 +52,7 @@
                     "name": "fourteen",
                     "category": "every_15m",
                     "priority": 10,
-                    "job": "optimized/queue",
+                    "job": "main",
                     "parameters": [
                         { "name": "PARAM1", "value": "moon" },
                         { "name": "PARAM2", "value": "sun" },

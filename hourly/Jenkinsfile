@@ -1,23 +1,142 @@
 pipeline {
-  agent any
-  options { timestamps() }
-  //triggers { cron('H/1 * * * *') } // hourly
-
+  agent { label 'master' }
+  parameters {
+    choice (choices: ['all','twenty','twentyone','twentytwo','twentythree','twentyfour'], description: 'Select job to run or all to run all jobs', name: 'JOB_TO_RUN')
+    choice (choices: ['live', 'staging'], description: 'Select environment to run jobs in', name: 'ENV_TO_RUN')
+  }
+  options {
+    // keep 15 builds for 30 days
+    buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
+    timestamps()
+  }
+  // triggers implement later
+  environment {
+    BUILD_BY = "${currentBuild.getBuildCauses()}"
+  }
   stages {
-    stage('Send to queue') {
+    stage('send all jobs to queue') {
+      when {
+        expression { BUILD_BY == 'null' }
+      }
       steps {
         script {
           def jsonText = readFile('hourly/hourly.json')
-          echo "Sending ${jsonText.length()} bytes from hourly.json to queue"
+          def parsedJson = new groovy.json.JsonSlurper().parseText(jsonText)
+          echo "Sending over to queue: ${jsonText}"
           build job: 'optimized/queue',
                 wait: false,
                 propagate: false,
                 parameters: [
-                  string(name: 'BATCH_JSON', value: jsonText),
-                  string(name: 'SOURCE',     value: 'hourly')
+                  string(name: 'Json_jobs', value: jsonText),
+                  string(name: 'Env_TO_RUN', value: "${params.ENV_TO_RUN}"),
                 ]
         }
       }
+    }
+    stage('triggered by user') {
+      when {
+        expression { BUILD_BY != 'null' }
+      }
+      steps {
+        script {
+          
+          // Read and parse JSON
+          def jsonText = readFile('hourly/hourly.json')
+          def parsedJson = new groovy.json.JsonSlurper().parseText(jsonText)
+          def allJobs = parsedJson.jobs ?: parsedJson  // Handle both {jobs:[..]} and direct array format
+          
+          // Debug output
+          echo "JSON structure class: ${allJobs.getClass()}"
+          echo "First job in list: ${allJobs ? allJobs[0] : 'No jobs found'}"
+          
+          def selectedJobs = []
+
+          if (params.JOB_TO_RUN == 'all') {
+            selectedJobs = allJobs
+            if (params.ENV_TO_RUN == 'live') {
+              echo "Running all jobs in live environment"
+              for (job in selectedJobs) {
+                job.priority = 12
+                echo "Set job ${job.name} priority to ${job.priority}"
+              }
+              echo "jobs to run: ${selectedJobs}"
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson(selectedJobs)),
+                ]
+              )
+            } else {
+              echo "Running all jobs in staging environment"
+              for (job in selectedJobs) {
+                job.priority = 4
+                echo "Set job ${job.name} priority to ${job.priority}"
+                def envParam = job.parameters?.find { it.name == 'env' }
+                if (envParam) {
+                  envParam.value = 'staging'
+                }
+                echo "jobs to run with priority and env changed: ${selectedJobs}"
+              }
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson(selectedJobs)),
+                ]
+              )
+            }
+          } else {
+            def selectedJob = null
+            for (job in allJobs) {
+              echo "Checking job: ${job}"
+              if (job && job.name?.toString() == params.JOB_TO_RUN?.toString()) {
+                selectedJob = job
+                echo "Selected job: ${selectedJob}"
+                break
+              }
+            }
+            
+            if (selectedJob == null) {
+              error "Could not find job with name: ${params.JOB_TO_RUN}"
+            }
+
+            if (params.ENV_TO_RUN == 'live') {
+              echo "Running job ${params.JOB_TO_RUN} in live environment"
+              selectedJob.priority = 14
+              echo "Set job ${selectedJob.name} priority to ${selectedJob.priority}"
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson([selectedJob])),
+                ]
+              )
+            } else {
+              echo "Running job ${params.JOB_TO_RUN} in staging environment"
+              selectedJob.priority = 6
+              echo "Set job ${selectedJob.name} priority to ${selectedJob.priority}"
+              def envParam = selectedJob.parameters?.find { it.name == 'env' }
+              if (envParam) {
+                envParam.value = 'staging'
+              }
+              build(
+                wait: false,
+                job: 'optimized/queue',
+                parameters: [
+                  string(name: 'ListOfJobs', value: groovy.json.JsonOutput.toJson([selectedJob])),
+                ]
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+  post {
+    always {
+      echo "hourly Jenkinsfile execution completed."
+      cleanWs()
     }
   }
 }
