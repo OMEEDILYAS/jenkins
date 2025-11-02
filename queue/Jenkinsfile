@@ -74,6 +74,19 @@ pipeline {
               def byPrio = (pb <=> pa)
               (byPrio != 0) ? byPrio : ((a.receivedAt ?: '') <=> (b.receivedAt ?: ''))
             }
+            
+            // normalize job parameters and ensure env=staging if missing
+            // (use the current queue object `cur`, not an undefined `queue` variable)
+            cur.jobs.each { j ->
+              if (!(j.parameters instanceof List)) { j.parameters = [] }
+              boolean hasEnv = false
+              for (p in j.parameters) {
+                if ((p?.name as String) == 'env') { hasEnv = true; break }
+              }
+              if (!hasEnv) {
+                j.parameters << [ name: 'env', value: 'staging' ]
+              }
+            }
 
             writeFile file: env.QUEUE_PATH,
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
