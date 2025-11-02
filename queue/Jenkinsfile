@@ -17,7 +17,7 @@ pipeline {
 
   stages {
 
-    /* --------------------------------
+     --------------------------------
      * Purge helper (run once then delete)
      * --------------------------------
     stage('PURGE QUEUE - RUN ONCE') {
@@ -28,7 +28,6 @@ pipeline {
         }
       }
     }
-    */
 
     stage('Ingest to queue.json') {
       steps {
@@ -175,6 +174,13 @@ pipeline {
             writeFile file: 'staging_claims.json',
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(stagingClaims))
 
+            // NEW: stash them so agents can fetch copies
+            stash name: 'live-claims',    includes: 'live_claims.json',    allowEmpty: true
+            stash name: 'staging-claims', includes: 'staging_claims.json', allowEmpty: true
+
+            echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
+
+
             echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
           } // lock
         }
@@ -199,6 +205,7 @@ pipeline {
           stage('Live worker') {
             steps {
               script {
+                unstash 'live-claims'   // NEW
                 def claims = parsePlainSafe(readFile('live_claims.json')) as List
                 int myIndex = indexFromAgent(env.AGENT_LABEL) // agent-1->0, agent-2->1, ...
                 if (myIndex < 0 || myIndex >= claims.size()) {
@@ -289,6 +296,7 @@ pipeline {
           stage('Staging worker') {
             steps {
               script {
+                unstash 'staging-claims'   // NEW
                 def claims = parsePlainSafe(readFile('staging_claims.json')) as List
                 int myIndex = indexFromAgent(env.AGENT_LABEL) // staging-1->0, ...
                 if (myIndex < 0 || myIndex >= claims.size()) {
