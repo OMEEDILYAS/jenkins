@@ -15,7 +15,6 @@ pipeline {
   options {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '50', daysToKeepStr: '30'))
-    disableConcurrentBuilds()
   }
 
   environment { QUEUE_PATH = 'queue.json' }
