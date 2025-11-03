@@ -110,40 +110,46 @@ pipeline {
     stage('Drain queue (loop until empty)') {
       steps {
         script {
-          int maxCycles = (params.MAX_CYCLES ?: '200') as int
-          int sleepSec  = (params.SLEEP_BETWEEN_SEC ?: '3') as int
-          int cycle = 0
+          boolean weAreRunner = false
+          // Only one build becomes the runner
+          lock(resource: 'queue-runner', inversePrecedence: true, skipIfLocked: true) {
+            weAreRunner = true
+            int maxCycles = (params.MAX_CYCLES ?: '200') as int
+            int sleepSec  = (params.SLEEP_BETWEEN_SEC ?: '3') as int
+            int cycle = 0
+            while (true) {
+              cycle++
+              echo "=== Cycle ${cycle} / ${maxCycles} ==="
+              def claimed = claimOnMaster((params.LIVE_MAX ?: '4') as int, (params.STAGING_MAX ?: '4') as int)
+              int liveCount = claimed.liveCount as int
+              int stagCount = claimed.stagingCount as int
 
-          while (true) {
-            cycle++
-            echo "=== Cycle ${cycle} / ${maxCycles} ==="
+              if (liveCount + stagCount == 0) {
+                def q = readQueue()
+                int stillRunning = (q.jobs as List).count { (it.status ?: '') == 'running' }
+                int stillQueued  = (q.jobs as List).count { (it.status ?: '') == 'queued' }
+                echo "Nothing claimed. queued=${stillQueued}, running=${stillRunning}"
+                if (stillRunning == 0 && stillQueued == 0) { echo 'Queue drained.'; break }
+                sleep time: sleepSec, unit: 'SECONDS'
+                if (cycle >= maxCycles) { echo "Hit MAX_CYCLES ${maxCycles}. Exiting."; break }
+                continue
+              }
 
-            def claimed = claimOnMaster((params.LIVE_MAX ?: '4') as int, (params.STAGING_MAX ?: '4') as int)
-            int liveCount = claimed.liveCount as int
-            int stagCount = claimed.stagingCount as int
+              if (liveCount  > 0) runLiveParallelOnce()
+              if (stagCount  > 0) runStagingParallelOnce()
 
-            if (liveCount + stagCount == 0) {
-              def q = readQueue()
-              int stillRunning = (q.jobs as List).count { (it.status ?: '') == 'running' }
-              int stillQueued  = (q.jobs as List).count { (it.status ?: '') == 'queued' }
-              echo "Nothing claimed this cycle. queued=${stillQueued}, running=${stillRunning}"
-              if (stillRunning == 0 && stillQueued == 0) { echo 'Queue is drained. Exiting loop.'; break }
               sleep time: sleepSec, unit: 'SECONDS'
               if (cycle >= maxCycles) { echo "Hit MAX_CYCLES ${maxCycles}. Exiting."; break }
-              continue
             }
+          } // lock queue-runner
 
-            if (liveCount  > 0) runLiveParallelOnce()
-            if (stagCount  > 0) runStagingParallelOnce()
-
-            sleep time: sleepSec, unit: 'SECONDS'
-            if (cycle >= maxCycles) { echo "Hit MAX_CYCLES ${maxCycles}. Exiting."; break }
+          if (!weAreRunner) {
+            echo "Another build is actively draining (queue-runner locked). We ingested and are exiting quickly."
           }
         }
       }
     }
   }
-
   post {
     always {
       script {
