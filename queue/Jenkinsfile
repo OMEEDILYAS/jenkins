@@ -3,20 +3,17 @@ pipeline {
 
   parameters {
     string(name: 'ListOfJobs', defaultValue: '', description: 'Upstream JSON payload ({"jobs":[...]})')
-    booleanParam(name: 'PURGE_QUEUE',        defaultValue: false, description: 'Wipe queue.json (fresh start)')
-    booleanParam(name: 'PURGE_DEADLETTER',   defaultValue: false, description: 'Clear deadLetter only')
-    booleanParam(name: 'REQUEUE_DEADLETTER', defaultValue: false, description: 'Move deadLetter -> jobs (attempts=0)')
-    string(name: 'LIVE_MAX',    defaultValue: '4', description: 'Max live claims per cycle (matrix fanout hint)')
-    string(name: 'STAGING_MAX', defaultValue: '4', description: 'Max staging claims per cycle (matrix fanout hint)')
-    string(name: 'IDLE_WAIT_SECS', defaultValue: '3', description: 'Sleep seconds when no work found for a worker')
-    string(name: 'IDLE_CYCLES',    defaultValue: '1', description: 'How many idle sleeps before a worker exits')
-    string(name: 'POLL_INGRESS_FILE', defaultValue: '', description: 'If set, workers will ingest this file ({"jobs":[...]}) periodically')
+    booleanParam(name: 'PURGE_QUEUE', defaultValue: false, description: 'If true, wipe queue.json (fresh start).')
+    booleanParam(name: 'PURGE_DEADLETTER', defaultValue: false, description: 'If true, clear deadLetter only.')
+    booleanParam(name: 'REQUEUE_DEADLETTER', defaultValue: false, description: 'Move all deadLetter items back to jobs (attempts=0, status=queued).')
+    string(name: 'LIVE_MAX', defaultValue: '4', description: 'Max live claims this cycle')
+    string(name: 'STAGING_MAX', defaultValue: '4', description: 'Max staging claims this cycle')
   }
 
   options {
     timestamps()
-    buildDiscarder(logRotator(numToKeepStr: '40', daysToKeepStr: '45'))
-    // disableConcurrentBuilds()  // keep concurrent possible; locking protects queue.json
+    buildDiscarder(logRotator(numToKeepStr: '50', daysToKeepStr: '30'))
+    disableConcurrentBuilds()
   }
 
   environment {
@@ -25,12 +22,18 @@ pipeline {
 
   stages {
 
+    /* ---------- Optional maintenance ops ---------- */
+
     stage('Optional: Purge queue/deadLetter') {
       when { expression { params.PURGE_QUEUE || params.PURGE_DEADLETTER } }
       steps {
         script {
           lock(resource: 'queue-json') {
-            def cur = ensureQueueShape(fileExists(env.QUEUE_PATH) ? parsePlainSafe(readFile(env.QUEUE_PATH)) : null)
+            def cur = [jobs: [], deadLetter: []]
+            if (fileExists(env.QUEUE_PATH)) {
+              def parsed = parsePlainSafe(readFile(env.QUEUE_PATH))
+              if (parsed instanceof Map) cur = parsed
+            }
             if (params.PURGE_QUEUE) {
               cur.jobs = []
               cur.deadLetter = []
@@ -41,6 +44,7 @@ pipeline {
             }
             writeFile file: env.QUEUE_PATH,
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+            stash name: 'queue-snapshot', includes: 'queue.json'
           }
         }
       }
@@ -54,7 +58,11 @@ pipeline {
             if (!fileExists(env.QUEUE_PATH)) {
               writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
             }
-            def cur    = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
+            def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+            if (!(cur instanceof Map)) cur = [jobs: [], deadLetter: []]
+            if (!(cur.jobs instanceof List)) cur.jobs = []
+            if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+
             def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
             int moved = 0
             (cur.deadLetter as List).each { j ->
@@ -66,128 +74,268 @@ pipeline {
               x.receivedAt = x.receivedAt ?: nowIso
               if (!(x.parameters instanceof List)) x.parameters = []
               if (!x.parameters.any { (it?.name as String) == 'env' }) {
-                x.parameters << [name:'env', value:(x.env ?: 'staging')]
+                x.parameters << [name: 'env', value: (x.env ?: 'staging')]
               }
               (cur.jobs as List) << x
               moved++
             }
             cur.deadLetter = []
-            cur.jobs = sortJobs(cur.jobs)
+            cur.jobs = sortJobs(cur.jobs as List)
+
             writeFile file: env.QUEUE_PATH,
                      text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+            stash name: 'queue-snapshot', includes: 'queue.json'
             echo "Requeued ${moved} items from deadLetter."
           }
         }
       }
     }
 
+    /* ---------- Ingest from upstream payload ---------- */
+
     stage('Initial Ingest (ListOfJobs)') {
       steps {
         script {
-          if (!fileExists(env.QUEUE_PATH)) {
-            writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-          }
-          if (!params.ListOfJobs?.trim()) {
-            echo 'No ListOfJobs provided; continuing without initial ingest.'
-            return
-          }
-
           lock(resource: 'queue-json') {
-            def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
+            if (!fileExists(env.QUEUE_PATH)) {
+              writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
+            }
+            def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+            if (!(cur instanceof Map)) cur = [jobs: [], deadLetter: []]
+            if (!(cur.jobs instanceof List)) cur.jobs = []
+            if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
-            def incoming = parseJobsToPlain(params.ListOfJobs) // -> [jobs:[...]]
-            def nowIso   = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+            if (params.ListOfJobs?.trim()) {
+              def incoming = parseJobsToPlain(params.ListOfJobs) // -> [jobs:[...]]
+              def nowIso   = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+              int added = 0
 
-            int added = 0
-            (incoming.jobs ?: []).each { j ->
-              def item = toPlain(j) ?: [:]
-              if (!(item.parameters instanceof List)) item.parameters = []
-              def envParam = item.parameters.find { it?.name?.toString() == 'env' }
-              def envValue = envParam?.value?.toString()?.toLowerCase()
-              if (!envValue) {
-                envValue = 'staging'
-                item.parameters << [name: 'env', value: envValue]
+              (incoming.jobs ?: []).each { j ->
+                def item = toPlain(j) ?: [:]
+                if (!(item.parameters instanceof List)) item.parameters = []
+
+                // normalize env
+                def envParam = item.parameters.find { (it?.name as String) == 'env' }
+                def envValue = envParam?.value?.toString()?.toLowerCase()
+                if (!envValue) {
+                  envValue = 'staging'
+                  item.parameters << [name: 'env', value: envValue]
+                }
+                item.env       = envValue
+                item.status    = 'queued'
+                item.attempts  = (item.attempts ?: 0) as int
+                item.receivedAt = item.receivedAt ?: nowIso
+
+                if (!item.job) {
+                  item.error = 'missing job name (ingest)'
+                  (cur.deadLetter as List) << item
+                } else {
+                  (cur.jobs as List) << item
+                  added++
+                }
               }
-              item.env        = envValue
-              item.status     = 'queued'
-              item.attempts   = (item.attempts ?: 0) as int
-              item.receivedAt = item.receivedAt ?: nowIso
 
-              if (!item.job) {
-                item.error = 'missing job name (ingest)'
-                (cur.deadLetter as List) << item
-              } else {
-                (cur.jobs as List) << item
-                added++
-              }
+              cur.jobs = sortJobs(cur.jobs as List)
+              writeFile file: env.QUEUE_PATH,
+                       text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+              echo "Queue updated: added=${added}, totalQueued=${(cur.jobs as List).count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
+              echo "Current jobs: " + (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
+            } else {
+              echo 'No ListOfJobs provided; skipping ingest.'
             }
 
-            cur.jobs = sortJobs(cur.jobs)
-
-            // normalize env param on legacy entries
-            cur.jobs.each { j ->
-              if (!(j.parameters instanceof List)) j.parameters = []
-              boolean hasEnv = j.parameters.any { (it?.name as String) == 'env' }
-              if (!hasEnv) {
-                j.parameters << [ name: 'env', value: (j.env ?: 'staging') ]
-              }
-            }
-
-            writeFile file: env.QUEUE_PATH,
-                     text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-
-            echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
-            echo "Current jobs: " + (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
-          } // lock
+            // make a first snapshot available
+            stash name: 'queue-snapshot', includes: 'queue.json'
+          }
         }
       }
     }
 
-    /* ------------------------ LIVE POOL ------------------------ */
+    /* ---------- Master-only claim & assignment ---------- */
+
+    stage('Claim live & staging (master only)') {
+      steps {
+        script {
+          lock(resource: 'queue-json') {
+            // Always use the freshest queue on master
+            if (fileExists(env.QUEUE_PATH)) { /* already in workspace */ }
+            else { writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}' }
+
+            def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+            if (!(cur instanceof Map)) cur = [jobs: [], deadLetter: []]
+            if (!(cur.jobs instanceof List)) cur.jobs = []
+            if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+
+            cur.jobs = sortJobs(cur.jobs as List)
+
+            int liveMax    = (params.LIVE_MAX ?: '4') as int
+            int stagingMax = (params.STAGING_MAX ?: '4') as int
+
+            def nowIso  = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+            def claimIdLive    = UUID.randomUUID().toString()
+            def claimIdStaging = UUID.randomUUID().toString()
+
+            def liveQueued    = (cur.jobs as List).findAll { (it.status ?: 'queued') == 'queued' && (it.env ?: 'staging') == 'live' }
+            def stagingQueued = (cur.jobs as List).findAll { (it.status ?: 'queued') == 'queued' && (it.env ?: 'staging') == 'staging' }
+
+            def liveClaims    = liveQueued.take(liveMax).collect   { toPlain(it) }
+            def stagingClaims = stagingQueued.take(stagingMax).collect{ toPlain(it) }
+
+            // mark running and attach claimIds
+            liveClaims.each { c ->
+              int idx = (cur.jobs as List).findIndexOf { j ->
+                (j?.job?.toString() == c.job?.toString()) &&
+                ((j?.name?.toString() ?: '') == (c.name?.toString() ?: '')) &&
+                (j?.receivedAt?.toString() == c.receivedAt?.toString()) &&
+                ((j?.status ?: 'queued') == 'queued') &&
+                ((j?.env ?: 'staging') == 'live')
+              }
+              if (idx >= 0) {
+                cur.jobs[idx].status    = 'running'
+                cur.jobs[idx].claimId   = claimIdLive
+                cur.jobs[idx].startedAt = nowIso
+                c.status    = 'running'
+                c.claimId   = claimIdLive
+                c.startedAt = nowIso
+              }
+            }
+
+            stagingClaims.each { c ->
+              int idx = (cur.jobs as List).findIndexOf { j ->
+                (j?.job?.toString() == c.job?.toString()) &&
+                ((j?.name?.toString() ?: '') == (c.name?.toString() ?: '')) &&
+                (j?.receivedAt?.toString() == c.receivedAt?.toString()) &&
+                ((j?.status ?: 'queued') == 'queued') &&
+                ((j?.env ?: 'staging') == 'staging')
+              }
+              if (idx >= 0) {
+                cur.jobs[idx].status    = 'running'
+                cur.jobs[idx].claimId   = claimIdStaging
+                cur.jobs[idx].startedAt = nowIso
+                c.status    = 'running'
+                c.claimId   = claimIdStaging
+                c.startedAt = nowIso
+              }
+            }
+
+            // persist queue and snapshots for workers
+            writeFile file: env.QUEUE_PATH,
+                     text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+
+            writeFile file: 'live_claims.json',
+                     text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(liveClaims))
+            writeFile file: 'staging_claims.json',
+                     text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(stagingClaims))
+
+            // stash snapshots (workers fetch these; they never lock queue.json)
+            stash name: 'queue-snapshot',  includes: 'queue.json'
+            stash name: 'live-claims',     includes: 'live_claims.json',    allowEmpty: true
+            stash name: 'staging-claims',  includes: 'staging_claims.json', allowEmpty: true
+
+            echo "Claimed live=${liveClaims.size()}, staging=${stagingClaims.size()}"
+          }
+        }
+      }
+    }
+
+    /* ---------- LIVE workers (consume snapshot only) ---------- */
 
     stage('LIVE pool (matrix)') {
+      when {
+        expression { fileExists('live_claims.json') && readFile('live_claims.json')?.trim() && readFile('live_claims.json').trim() != '[]' }
+      }
       matrix {
         axes {
-          axis { name 'AGENT_LABEL'; values 'agent-1','agent-2','agent-3','agent-4' }
+          axis {
+            name 'AGENT_LABEL'
+            values 'agent-1','agent-2','agent-3','agent-4'
+          }
         }
         agent { label "${AGENT_LABEL}" }
+
         stages {
-          stage('Live worker loop') {
+          stage('Live worker') {
             steps {
               script {
-                int idleWait  = (params.IDLE_WAIT_SECS ?: '10') as int
-                int idleLeft  = (params.IDLE_CYCLES    ?: '36') as int
-                while (true) {
-                  ingestDropfileIfPresent(params.POLL_INGRESS_FILE)
-                  def claimKey = UUID.randomUUID().toString()
-                  def item     = claimNext('live', claimKey)
+                unstash 'live-claims'
+                def claimsObj = parsePlainSafe(readFile('live_claims.json'))
+                def claims = (claimsObj instanceof List) ? claimsObj : []
+                int myIndex = indexFromAgent(env.AGENT_LABEL)
+                if (myIndex < 0 || myIndex >= claims.size()) {
+                  echo "[${env.AGENT_LABEL}] No assigned live item; skipping."
+                  return
+                }
 
-                  if (!(item instanceof Map)) {
-                    if (idleLeft-- > 0) { sleep time: idleWait, unit: 'SECONDS'; continue }
-                    echo "[${env.AGENT_LABEL}] No LIVE work after idle window; exiting."
-                    break
-                  }
+                def item = toPlain(claims[myIndex])
+                if (!(item instanceof Map)) {
+                  echo "[${env.AGENT_LABEL}] Assigned claim is not a Map; skipping."
+                  return
+                }
 
-                  def safeParams = (item?.parameters instanceof List) ? item.parameters : []
-                  safeParams = safeParams.findAll { it instanceof Map && it.name != null }
-                  def plist = safeParams.collect { kv ->
-                    string(name: kv.name.toString(), value: (kv.value == null ? '' : kv.value.toString()))
-                  }
+                def jobName = item.job?.toString()
+                if (!jobName) {
+                  echo "[${env.AGENT_LABEL}] Missing job name; skipping."
+                  return
+                }
 
-                  boolean ok = true
-                  String err = null
-                  def jobName = item.job.toString()
-                  try {
-                    echo "[${env.AGENT_LABEL}] ▶ LIVE ${item.name ?: jobName} (prio=${item.priority ?: 0})"
-                    build job: jobName, wait: true, propagate: true, parameters: plist
-                    echo "[${env.AGENT_LABEL}] ✔ LIVE done ${item.name ?: jobName}"
-                  } catch (e) {
-                    ok = false
-                    err = e.getMessage()
-                    echo "[${env.AGENT_LABEL}] ✖ LIVE fail ${item.name ?: jobName}: ${err}"
+                def plist = (item.parameters instanceof List) ? (item.parameters.collect { kv ->
+                  string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
+                }) : []
+
+                boolean ok = true
+                String err = null
+                try {
+                  echo "[${env.AGENT_LABEL}] ▶ LIVE ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
+                  build job: jobName, wait: true, propagate: true, parameters: plist
+                  echo "[${env.AGENT_LABEL}] ✔ LIVE done ${item.name ?: jobName}"
+                } catch (e) {
+                  ok = false
+                  err = e.getMessage()
+                  echo "[${env.AGENT_LABEL}] ✖ LIVE fail ${item.name ?: jobName}: ${err}"
+                }
+
+                // Finalize result on master only
+                node('master') {
+                  lock(resource: 'queue-json') {
+                    unstash 'queue-snapshot'
+                    def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+                    if (!(cur instanceof Map)) cur = [jobs: [], deadLetter: []]
+                    if (!(cur.jobs instanceof List)) cur.jobs = []
+                    if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+
+                    int idx = (cur.jobs as List).findIndexOf { j ->
+                      (j?.status == 'running') &&
+                      (j?.claimId?.toString()   == item.claimId?.toString()) &&
+                      (j?.job?.toString()       == jobName) &&
+                      ((j?.name?.toString() ?: '') == (item.name?.toString() ?: ''))
+                    }
+
+                    if (idx >= 0) {
+                      def j = cur.jobs[idx]
+                      if (ok) {
+                        cur.jobs.remove(idx)
+                      } else {
+                        int attempts = ((j.attempts ?: 0) as int) + 1
+                        j.attempts = attempts
+                        if (attempts >= 3) {
+                          j.status = 'failed'
+                          j.error  = err ?: 'unknown'
+                          (cur.deadLetter as List) << j
+                          cur.jobs.remove(idx)
+                        } else {
+                          j.status    = 'queued'
+                          j.claimId   = null
+                          j.startedAt = null
+                          cur.jobs[idx] = j
+                        }
+                      }
+                      writeFile file: env.QUEUE_PATH,
+                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      stash name: 'queue-snapshot', includes: 'queue.json'
+                    } else {
+                      echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
+                    }
                   }
-                  finalizeOne(item, ok, err)
-                  idleLeft = (params.IDLE_CYCLES ?: '36') as int
                 }
               }
             }
@@ -196,51 +344,104 @@ pipeline {
       }
     }
 
-    /* ---------------------- STAGING POOL ---------------------- */
+    /* ---------- STAGING workers (consume snapshot only) ---------- */
 
     stage('STAGING pool (matrix)') {
+      when {
+        expression { fileExists('staging_claims.json') && readFile('staging_claims.json')?.trim() && readFile('staging_claims.json').trim() != '[]' }
+      }
       matrix {
         axes {
-          axis { name 'AGENT_LABEL'; values 'staging-1','staging-2','staging-3','staging-4' }
+          axis {
+            name 'AGENT_LABEL'
+            values 'staging-1','staging-2','staging-3','staging-4'
+          }
         }
         agent { label "${AGENT_LABEL}" }
+
         stages {
-          stage('Staging worker loop') {
+          stage('Staging worker') {
             steps {
               script {
-                int idleWait  = (params.IDLE_WAIT_SECS ?: '10') as int
-                int idleLeft  = (params.IDLE_CYCLES    ?: '36') as int
-                while (true) {
-                  ingestDropfileIfPresent(params.POLL_INGRESS_FILE)
-                  def claimKey = UUID.randomUUID().toString()
-                  def item     = claimNext('staging', claimKey)
+                unstash 'staging-claims'
+                def claimsObj = parsePlainSafe(readFile('staging_claims.json'))
+                def claims = (claimsObj instanceof List) ? claimsObj : []
+                int myIndex = indexFromAgent(env.AGENT_LABEL)
+                if (myIndex < 0 || myIndex >= claims.size()) {
+                  echo "[${env.AGENT_LABEL}] No assigned staging item; skipping."
+                  return
+                }
 
-                  if (!(item instanceof Map)) {
-                    if (idleLeft-- > 0) { sleep time: idleWait, unit: 'SECONDS'; continue }
-                    echo "[${env.AGENT_LABEL}] No STAGING work after idle window; exiting."
-                    break
-                  }
+                def item = toPlain(claims[myIndex])
+                if (!(item instanceof Map)) {
+                  echo "[${env.AGENT_LABEL}] Assigned claim is not a Map; skipping."
+                  return
+                }
 
-                  def safeParams = (item?.parameters instanceof List) ? item.parameters : []
-                  safeParams = safeParams.findAll { it instanceof Map && it.name != null }
-                  def plist = safeParams.collect { kv ->
-                    string(name: kv.name.toString(), value: (kv.value == null ? '' : kv.value.toString()))
-                  }
+                def jobName = item.job?.toString()
+                if (!jobName) {
+                  echo "[${env.AGENT_LABEL}] Missing job name; skipping."
+                  return
+                }
 
-                  boolean ok = true
-                  String err = null
-                  def jobName = item.job.toString()
-                  try {
-                    echo "[${env.AGENT_LABEL}] ▶ STAGING ${item.name ?: jobName} (prio=${item.priority ?: 0})"
-                    build job: jobName, wait: true, propagate: true, parameters: plist
-                    echo "[${env.AGENT_LABEL}] ✔ STAGING done ${item.name ?: jobName}"
-                  } catch (e) {
-                    ok = false
-                    err = e.getMessage()
-                    echo "[${env.AGENT_LABEL}] ✖ STAGING fail ${item.name ?: jobName}: ${err}"
+                def plist = (item.parameters instanceof List) ? (item.parameters.collect { kv ->
+                  string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
+                }) : []
+
+                boolean ok = true
+                String err = null
+                try {
+                  echo "[${env.AGENT_LABEL}] ▶ STAGING ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
+                  build job: jobName, wait: true, propagate: true, parameters: plist
+                  echo "[${env.AGENT_LABEL}] ✔ STAGING done ${item.name ?: jobName}"
+                } catch (e) {
+                  ok = false
+                  err = e.getMessage()
+                  echo "[${env.AGENT_LABEL}] ✖ STAGING fail ${item.name ?: jobName}: ${err}"
+                }
+
+                // Finalize result on master only
+                node('master') {
+                  lock(resource: 'queue-json') {
+                    unstash 'queue-snapshot'
+                    def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+                    if (!(cur instanceof Map)) cur = [jobs: [], deadLetter: []]
+                    if (!(cur.jobs instanceof List)) cur.jobs = []
+                    if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+
+                    int idx = (cur.jobs as List).findIndexOf { j ->
+                      (j?.status == 'running') &&
+                      (j?.claimId?.toString()   == item.claimId?.toString()) &&
+                      (j?.job?.toString()       == jobName) &&
+                      ((j?.name?.toString() ?: '') == (item.name?.toString() ?: ''))
+                    }
+
+                    if (idx >= 0) {
+                      def j = cur.jobs[idx]
+                      if (ok) {
+                        cur.jobs.remove(idx)
+                      } else {
+                        int attempts = ((j.attempts ?: 0) as int) + 1
+                        j.attempts = attempts
+                        if (attempts >= 3) {
+                          j.status = 'failed'
+                          j.error  = err ?: 'unknown'
+                          (cur.deadLetter as List) << j
+                          cur.jobs.remove(idx)
+                        } else {
+                          j.status    = 'queued'
+                          j.claimId   = null
+                          j.startedAt = null
+                          cur.jobs[idx] = j
+                        }
+                      }
+                      writeFile file: env.QUEUE_PATH,
+                               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
+                      stash name: 'queue-snapshot', includes: 'queue.json'
+                    } else {
+                      echo "[${env.AGENT_LABEL}] WARN: Claimed item not found during finalize."
+                    }
                   }
-                  finalizeOne(item, ok, err)
-                  idleLeft = (params.IDLE_CYCLES ?: '36') as int
                 }
               }
             }
@@ -254,8 +455,11 @@ pipeline {
     always {
       script {
         if (fileExists(env.QUEUE_PATH)) {
-          def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
-          echo "Final queue: queued=${cur.jobs.count{ it.status=='queued' }}, running=${cur.jobs.count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List).size()}"
+          def cur = parsePlainSafe(readFile(env.QUEUE_PATH))
+          if (!(cur instanceof Map)) cur = [jobs:[], deadLetter:[]]
+          if (!(cur.jobs instanceof List)) cur.jobs = []
+          if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
+          echo "Final queue: queued=${(cur.jobs as List).count{ it.status=='queued' }}, running=${(cur.jobs as List).count{ it.status=='running' }}, deadLetter=${(cur.deadLetter as List).size()}"
           echo "Remaining jobs: " + (cur.jobs as List).collect{ it.name ?: it.job }.join(', ')
         }
       }
@@ -263,7 +467,7 @@ pipeline {
   }
 }
 
-/* ===================== Helpers (CPS-safe) ===================== */
+/* ----------------------- Helpers (CPS-safe) ----------------------- */
 
 @NonCPS
 def parseJobsToPlain(String raw) {
@@ -272,10 +476,10 @@ def parseJobsToPlain(String raw) {
   try { obj = sl.parseText(raw?.trim()) } catch (e) {
     throw new Exception("Invalid JSON (${e.message}). First 200 chars: ${raw?.take(200)}")
   }
-  if (obj instanceof String) obj = sl.parseText(obj) // handle double-encoded
+  if (obj instanceof String) obj = sl.parseText(obj) // double-encoded
   if (obj instanceof List)   obj = [jobs: obj]
-  else if (!(obj instanceof Map) || !(obj.jobs instanceof List))
-    throw new Exception('Expected top-level {"jobs":[...]} or a bare array.')
+  if (!(obj instanceof Map)) throw new Exception('Top-level must be Map or List.')
+  if (!(obj.jobs instanceof List)) obj.jobs = []
   return toPlain(obj)
 }
 
@@ -296,36 +500,6 @@ def toPlain(Object o) {
   return o
 }
 
-/** Ensure we always have a {jobs:[], deadLetter:[]} map, no matter what was parsed. */
-@NonCPS
-def ensureQueueShape(Object parsed) {
-  def m
-  if (parsed instanceof Map) {
-    m = toPlain(parsed)
-  } else if (parsed instanceof List) {
-    m = [jobs: toPlain(parsed), deadLetter: []]
-  } else {
-    m = [jobs: [], deadLetter: []]
-  }
-  if (!(m.jobs instanceof List))       m.jobs = []
-  if (!(m.deadLetter instanceof List)) m.deadLetter = []
-  // make sure every job has a parameters list to avoid NPEs
-  m.jobs = m.jobs.findAll { it instanceof Map }.collect { j ->
-    def x = toPlain(j)
-    if (!(x.parameters instanceof List)) x.parameters = []
-    return x
-  }
-  return m
-}
-
-@NonCPS
-def sanitizeJobs(Object jobsObj) {
-  def L = (jobsObj instanceof List) ? jobsObj : []
-  def cleaned = L.findAll { it instanceof Map }.collect { toPlain(it) }
-  cleaned.each { j -> if (!(j.parameters instanceof List)) j.parameters = [] }
-  return cleaned
-}
-
 @NonCPS
 def sortJobs(List jobs) {
   if (!(jobs instanceof List)) return []
@@ -333,156 +507,23 @@ def sortJobs(List jobs) {
   copy.sort { a, b ->
     int pa = ((a?.priority) ?: 0) as int
     int pb = ((b?.priority) ?: 0) as int
-    def cmp = (pb <=> pa)  // higher priority first
+    def cmp = (pb <=> pa)                 // higher priority first
     if (cmp != 0) return cmp
     String ra = (a?.receivedAt ?: '')
     String rb = (b?.receivedAt ?: '')
-    return (ra <=> rb)     // FIFO
+    return (ra <=> rb)                    // FIFO
   }
   return copy
 }
 
-/** Atomically claim the next queued item for given env ('live' | 'staging'). */
-def claimNext(String envName, String claimKey) {
-  def claimed = null
-  lock(resource: 'queue-json') {
-    if (!fileExists(env.QUEUE_PATH)) {
-      writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-    }
-    def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
-
-    // normalize env on all entries
-    cur.jobs.each { j ->
-      if (!j.parameters.any { (it?.name as String) == 'env' }) {
-        j.parameters << [ name:'env', value:(j.env ?: 'staging') ]
-      }
-      j.env = (j.env ?: (j.parameters.find { it?.name=='env' }?.value ?: 'staging'))
-                .toString().toLowerCase()
-    }
-
-    cur.jobs = sortJobs(cur.jobs)
-
-    int idx = -1
-    for (int i=0; i<cur.jobs.size(); i++) {
-      def j = cur.jobs[i]
-      if ((j?.status ?: 'queued') == 'queued' && (j?.env ?: 'staging') == envName) { idx = i; break }
-    }
-
-    if (idx >= 0) {
-      def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-      def item   = toPlain(cur.jobs[idx])
-      item.status    = 'running'
-      item.claimId   = claimKey
-      item.startedAt = nowIso
-      cur.jobs[idx]  = item
-      writeFile file: env.QUEUE_PATH,
-               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-      claimed = toPlain(item)
-    }
-  }
-  return (claimed instanceof Map) ? claimed : null
-}
-
-/** Finalize a single claimed item: remove on success, or requeue / deadletter on failure. */
-def finalizeOne(Object item, boolean ok, String errMsg) {
-  if (!(item instanceof Map)) { echo "[finalizeOne] Skipping finalize: null/invalid item."; return }
-  lock(resource: 'queue-json') {
-    if (!fileExists(env.QUEUE_PATH)) {
-      writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-    }
-    def cur = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
-
-    int idx = (cur.jobs as List).findIndexOf { j ->
-      (j?.status == 'running') &&
-      (j?.claimId?.toString() == item.claimId?.toString()) &&
-      (j?.job?.toString()     == item.job?.toString()) &&
-      ((j?.name?.toString() ?: '') == (item.name?.toString() ?: ''))
-    }
-
-    if (idx >= 0) {
-      def j = cur.jobs[idx]
-      if (ok) {
-        cur.jobs.remove(idx)
-      } else {
-        int attempts = ((j.attempts ?: 0) as int) + 1
-        j.attempts = attempts
-        if (attempts >= 3) {
-          j.status = 'failed'
-          j.error  = errMsg ?: 'unknown'
-          (cur.deadLetter as List) << j
-          cur.jobs.remove(idx)
-        } else {
-          j.status    = 'queued'
-          j.claimId   = null
-          j.startedAt = null
-          cur.jobs[idx] = j
-        }
-      }
-      writeFile file: env.QUEUE_PATH,
-               text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-    } else {
-      echo "[finalizeOne] WARN: Claimed item not found in queue during finalize."
-    }
-  }
-}
-
-/** If POLL_INGRESS_FILE is set and contains {"jobs":[...]}, ingest it atomically and clear it. */
-def ingestDropfileIfPresent(String path) {
-  if (!path?.trim()) return
-  lock(resource: 'queue-json') {
-    def content = null
-    try {
-      if (fileExists(path)) {
-        content = readFile(path)?.trim()
-      }
-    } catch (ignored) {}
-
-    if (!content) return
-
-    def incoming = null
-    try {
-      incoming = parseJobsToPlain(content) // -> [jobs:[...]]
-    } catch (e) {
-      echo "[ingestDropfileIfPresent] Invalid dropfile JSON: ${e.message}"
-      return
-    }
-
-    if (!fileExists(env.QUEUE_PATH)) {
-      writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-    }
-    def cur    = ensureQueueShape(parsePlainSafe(readFile(env.QUEUE_PATH)))
-    def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-
-    int added = 0
-    (incoming.jobs ?: []).each { j ->
-      def item = toPlain(j) ?: [:]
-      if (!(item.parameters instanceof List)) item.parameters = []
-      def envParam = item.parameters.find { it?.name?.toString() == 'env' }
-      def envValue = envParam?.value?.toString()?.toLowerCase()
-      if (!envValue) {
-        envValue = 'staging'
-        item.parameters << [name: 'env', value: envValue]
-      }
-      item.env        = envValue
-      item.status     = 'queued'
-      item.attempts   = (item.attempts ?: 0) as int
-      item.receivedAt = item.receivedAt ?: nowIso
-
-      if (!item.job) {
-        item.error = 'missing job name (dropfile ingest)'
-        (cur.deadLetter as List) << item
-      } else {
-        (cur.jobs as List) << item
-        added++
-      }
-    }
-
-    cur.jobs = sortJobs(cur.jobs)
-    writeFile file: env.QUEUE_PATH,
-             text: groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(cur))
-
-    // clear the dropfile after successful ingest
-    try { writeFile file: path, text: '' } catch (ignored) {}
-    echo "[ingestDropfileIfPresent] Ingested ${added} new job(s) from ${path}."
+// 'agent-1' -> 0, 'agent-2' -> 1, 'staging-1' -> 0, etc.
+@NonCPS
+def indexFromAgent(String label) {
+  if (!label) return -1
+  try {
+    def parts = label.split('-')
+    return Math.max(0, Integer.parseInt(parts[-1]) - 1)
+  } catch (ignored) {
+    return -1
   }
 }
