@@ -18,30 +18,18 @@ pipeline {
     disableConcurrentBuilds()
   }
 
-  environment {
-    QUEUE_PATH = 'queue.json'
-  }
+  environment { QUEUE_PATH = 'queue.json' }
 
   stages {
-
-    /* ---------- optional maintenance ---------- */
 
     stage('Optional: Purge queue/deadLetter') {
       when { expression { params.PURGE_QUEUE || params.PURGE_DEADLETTER } }
       steps {
         script {
           lock(resource: 'queue-json') {
-            def cur = [jobs: [], deadLetter: []]
-            if (fileExists(env.QUEUE_PATH)) {
-              cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: cur
-            }
-            if (params.PURGE_QUEUE) {
-              cur.jobs = []; cur.deadLetter = []
-              echo 'Queue + DeadLetter wiped.'
-            } else if (params.PURGE_DEADLETTER) {
-              cur.deadLetter = []
-              echo 'DeadLetter wiped.'
-            }
+            def cur = fileExists(env.QUEUE_PATH) ? (parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[],deadLetter:[]]) : [jobs:[],deadLetter:[]]
+            if (params.PURGE_QUEUE)      { cur.jobs = []; cur.deadLetter = []; echo 'Queue + DeadLetter wiped.' }
+            else if (params.PURGE_DEADLETTER) { cur.deadLetter = []; echo 'DeadLetter wiped.' }
             writeFile file: env.QUEUE_PATH, text: pretty(cur)
             stash name: 'queue-snapshot', includes: 'queue.json'
           }
@@ -54,10 +42,8 @@ pipeline {
       steps {
         script {
           lock(resource: 'queue-json') {
-            if (!fileExists(env.QUEUE_PATH)) {
-              writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-            }
-            def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
+            if (!fileExists(env.QUEUE_PATH)) writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
+            def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
             if (!(cur.jobs instanceof List)) cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
             def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
@@ -82,55 +68,44 @@ pipeline {
       }
     }
 
-    /* ---------- initial ingest ---------- */
-
     stage('Initial Ingest (ListOfJobs)') {
       steps {
         script {
-          lock(resource: 'queue-json') {
-            if (!fileExists(env.QUEUE_PATH)) {
-              writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
-            }
-            def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs: [], deadLetter: []]
+          lock(resource:'queue-json') {
+            if (!fileExists(env.QUEUE_PATH)) writeFile file: env.QUEUE_PATH, text: '{"jobs":[],"deadLetter":[]}'
+            def cur = parsePlainSafe(readFile(env.QUEUE_PATH)) ?: [jobs:[], deadLetter:[]]
             if (!(cur.jobs instanceof List)) cur.jobs = []
             if (!(cur.deadLetter instanceof List)) cur.deadLetter = []
 
             int added = 0
             if (params.ListOfJobs?.trim()) {
-              def incoming = parseJobsToPlain(params.ListOfJobs) // -> [jobs:[...]]
-              def nowIso   = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
-              (incoming.jobs ?: []).each { j ->
+              def inc = parseJobsToPlain(params.ListOfJobs)
+              def nowIso = new Date().format("yyyy-MM-dd'T'HH:mm:ssXXX")
+              (inc.jobs ?: []).each { j ->
                 def item = toPlain(j) ?: [:]
                 if (!(item.parameters instanceof List)) item.parameters = []
                 def envParam = item.parameters.find { (it?.name as String) == 'env' }
-                def envValue = envParam?.value?.toString()?.toLowerCase()
-                if (!envValue) { envValue = 'staging'; item.parameters << [name:'env', value: envValue] }
-                item.env = envValue
+                def envVal = envParam?.value?.toString()?.toLowerCase()
+                if (!envVal) { envVal = 'staging'; item.parameters << [name:'env', value:envVal] }
+                item.env = envVal
                 item.status='queued'
                 item.attempts = (item.attempts ?: 0) as int
                 item.receivedAt = item.receivedAt ?: nowIso
-                if (!item.job) {
-                  item.error = 'missing job name (ingest)'
-                  (cur.deadLetter as List) << item
-                } else {
-                  (cur.jobs as List) << item; added++
-                }
+                if (!item.job) { item.error='missing job name (ingest)'; (cur.deadLetter as List) << item }
+                else { (cur.jobs as List) << item; added++ }
               }
               cur.jobs = sortJobs(cur.jobs as List)
-              echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count { it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
-              echo "Current jobs: " + (cur.jobs as List).collect { it.name ?: it.job }.join(', ')
+              echo "Queue updated: added=${added}, totalQueued=${cur.jobs.count{ it.status=='queued' }}, deadLetter=${(cur.deadLetter as List).size()}"
+              echo "Current jobs: " + (cur.jobs as List).collect{ it.name ?: it.job }.join(', ')
             } else {
-              echo "No ListOfJobs provided; skipping ingest."
+              echo 'No ListOfJobs provided; skipping ingest.'
             }
-
             writeFile file: env.QUEUE_PATH, text: pretty(cur)
             stash name: 'queue-snapshot', includes: 'queue.json'
           }
         }
       }
     }
-
-    /* ---------- drain loop ---------- */
 
     stage('Drain queue (loop until empty)') {
       steps {
@@ -143,46 +118,31 @@ pipeline {
             cycle++
             echo "=== Cycle ${cycle} / ${maxCycles} ==="
 
-            // 1) Master-only claim
             def claimed = claimOnMaster((params.LIVE_MAX ?: '4') as int, (params.STAGING_MAX ?: '4') as int)
+            int liveCount = claimed.liveCount as int
+            int stagCount = claimed.stagingCount as int
 
-            int liveCount    = claimed.liveCount as int
-            int stagingCount = claimed.stagingCount as int
-
-            // 2) If nothing to claim, check if anything is still running; if not, we’re done
-            if (liveCount + stagingCount == 0) {
+            if (liveCount + stagCount == 0) {
               def q = readQueue()
               int stillRunning = (q.jobs as List).count { (it.status ?: '') == 'running' }
               int stillQueued  = (q.jobs as List).count { (it.status ?: '') == 'queued' }
               echo "Nothing claimed this cycle. queued=${stillQueued}, running=${stillRunning}"
-              if (stillRunning == 0 && stillQueued == 0) {
-                echo "Queue is drained. Exiting loop."
-                break
-              }
+              if (stillRunning == 0 && stillQueued == 0) { echo 'Queue is drained. Exiting loop.'; break }
               sleep time: sleepSec, unit: 'SECONDS'
-              if (cycle >= maxCycles) {
-                echo "Hit MAX_CYCLES (${maxCycles}). Exiting to avoid infinite loop."
-                break
-              }
+              if (cycle >= maxCycles) { echo "Hit MAX_CYCLES ${maxCycles}. Exiting."; break }
               continue
             }
 
-            // 3) Run LIVE & STAGING matrices for this batch
-            if (liveCount > 0) runLiveMatrixOnce()
-            if (stagingCount > 0) runStagingMatrixOnce()
+            if (liveCount  > 0) runLiveParallelOnce()
+            if (stagCount  > 0) runStagingParallelOnce()
 
-            // 4) small pause to avoid tight re-claim
             sleep time: sleepSec, unit: 'SECONDS'
-
-            if (cycle >= maxCycles) {
-              echo "Hit MAX_CYCLES (${maxCycles}). Exiting to avoid infinite loop."
-              break
-            }
-          } // while
+            if (cycle >= maxCycles) { echo "Hit MAX_CYCLES ${maxCycles}. Exiting."; break }
+          }
         }
       }
     }
-  } // stages
+  }
 
   post {
     always {
@@ -195,97 +155,79 @@ pipeline {
   }
 }
 
-/* ----------------------- Helpers ----------------------- */
+/* ----------------------- Workers: scripted parallel ----------------------- */
 
-def runLiveMatrixOnce() {
-  stage('LIVE pool (matrix)') {
-    whenTrue(fileExists('live_claims.json') && readFile('live_claims.json')?.trim() && readFile('live_claims.json').trim() != '[]') {
-      matrix {
-        axes {
-          axis { name 'AGENT_LABEL'; values 'agent-1','agent-2','agent-3','agent-4' }
-        }
-        agent { label "${AGENT_LABEL}" }
-        stages {
-          stage('Live worker') {
-            steps {
-              script {
-                unstash 'live-claims'
-                def claimsObj = parsePlainSafe(readFile('live_claims.json'))
-                def claims = (claimsObj instanceof List) ? claimsObj : []
-                int myIndex = indexFromAgent(env.AGENT_LABEL)
-                if (myIndex < 0 || myIndex >= claims.size()) { echo "[${env.AGENT_LABEL}] No assigned live item; skipping."; return }
-
-                def item = toPlain(claims[myIndex]) as Map
-                def jobName = item.job?.toString()
-                if (!jobName) { echo "[${env.AGENT_LABEL}] Missing job name; skipping."; return }
-                def plist = (item.parameters instanceof List) ? item.parameters.collect { kv ->
-                  string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
-                } : []
-
-                boolean ok = true; String err = null
-                try {
-                  echo "[${env.AGENT_LABEL}] ▶ LIVE ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
-                  build job: jobName, wait: true, propagate: true, parameters: plist
-                  echo "[${env.AGENT_LABEL}] ✔ LIVE done ${item.name ?: jobName}"
-                } catch (e) {
-                  ok = false; err = e.getMessage()
-                  echo "[${env.AGENT_LABEL}] ✖ LIVE fail ${item.name ?: jobName}: ${err}"
-                }
-
-                finalizeOnMaster(item, jobName, ok, err)
-              }
-            }
-          }
+def runLiveParallelOnce() {
+  stage('LIVE pool (parallel)') {
+    if (!(fileExists('live_claims.json') && readFile('live_claims.json')?.trim() && readFile('live_claims.json').trim() != '[]')) {
+      echo 'No live claims file or empty; skipping live.'
+      return
+    }
+    def claimsObj = parsePlainSafe(readFile('live_claims.json'))
+    def claims = (claimsObj instanceof List) ? claimsObj : []
+    def branches = [:]
+    ['agent-1','agent-2','agent-3','agent-4'].each { label ->
+      def idx = indexFromAgent(label)
+      branches[label] = {
+        node(label) {
+          checkout scm
+          if (idx < 0 || idx >= claims.size()) { echo "[${label}] No assigned live item; skipping."; return }
+          def item = toPlain(claims[idx]) as Map
+          def jobName = item.job?.toString()
+          if (!jobName) { echo "[${label}] Missing job name; skipping."; return }
+          def plist = (item.parameters instanceof List) ? item.parameters.collect { kv ->
+            string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
+          } : []
+          boolean ok = true; String err = null
+          try {
+            echo "[${label}] ▶ LIVE ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
+            build job: jobName, wait: true, propagate: true, parameters: plist
+            echo "[${label}] ✔ LIVE done ${item.name ?: jobName}"
+          } catch (e) { ok=false; err=e.getMessage(); echo "[${label}] ✖ LIVE fail ${item.name ?: jobName}: ${err}" }
+          finalizeOnMaster(item, jobName, ok, err, label)
         }
       }
     }
+    parallel branches
   }
 }
 
-def runStagingMatrixOnce() {
-  stage('STAGING pool (matrix)') {
-    whenTrue(fileExists('staging_claims.json') && readFile('staging_claims.json')?.trim() && readFile('staging_claims.json').trim() != '[]') {
-      matrix {
-        axes {
-          axis { name 'AGENT_LABEL'; values 'staging-1','staging-2','staging-3','staging-4' }
-        }
-        agent { label "${AGENT_LABEL}" }
-        stages {
-          stage('Staging worker') {
-            steps {
-              script {
-                unstash 'staging-claims'
-                def claimsObj = parsePlainSafe(readFile('staging_claims.json'))
-                def claims = (claimsObj instanceof List) ? claimsObj : []
-                int myIndex = indexFromAgent(env.AGENT_LABEL)
-                if (myIndex < 0 || myIndex >= claims.size()) { echo "[${env.AGENT_LABEL}] No assigned staging item; skipping."; return }
-
-                def item = toPlain(claims[myIndex]) as Map
-                def jobName = item.job?.toString()
-                if (!jobName) { echo "[${env.AGENT_LABEL}] Missing job name; skipping."; return }
-                def plist = (item.parameters instanceof List) ? item.parameters.collect { kv ->
-                  string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
-                } : []
-
-                boolean ok = true; String err = null
-                try {
-                  echo "[${env.AGENT_LABEL}] ▶ STAGING ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
-                  build job: jobName, wait: true, propagate: true, parameters: plist
-                  echo "[${env.AGENT_LABEL}] ✔ STAGING done ${item.name ?: jobName}"
-                } catch (e) {
-                  ok = false; err = e.getMessage()
-                  echo "[${env.AGENT_LABEL}] ✖ STAGING fail ${item.name ?: jobName}: ${err}"
-                }
-
-                finalizeOnMaster(item, jobName, ok, err)
-              }
-            }
-          }
+def runStagingParallelOnce() {
+  stage('STAGING pool (parallel)') {
+    if (!(fileExists('staging_claims.json') && readFile('staging_claims.json')?.trim() && readFile('staging_claims.json').trim() != '[]')) {
+      echo 'No staging claims file or empty; skipping staging.'
+      return
+    }
+    def claimsObj = parsePlainSafe(readFile('staging_claims.json'))
+    def claims = (claimsObj instanceof List) ? claimsObj : []
+    def branches = [:]
+    ['staging-1','staging-2','staging-3','staging-4'].each { label ->
+      def idx = indexFromAgent(label)
+      branches[label] = {
+        node(label) {
+          checkout scm
+          if (idx < 0 || idx >= claims.size()) { echo "[${label}] No assigned staging item; skipping."; return }
+          def item = toPlain(claims[idx]) as Map
+          def jobName = item.job?.toString()
+          if (!jobName) { echo "[${label}] Missing job name; skipping."; return }
+          def plist = (item.parameters instanceof List) ? item.parameters.collect { kv ->
+            string(name: (kv?.name?.toString() ?: ''), value: (kv?.value == null ? '' : kv.value.toString()))
+          } : []
+          boolean ok = true; String err = null
+          try {
+            echo "[${label}] ▶ STAGING ${item.name ?: jobName} (env=${item.env ?: 'staging'}, prio=${item.priority ?: 0})"
+            build job: jobName, wait: true, propagate: true, parameters: plist
+            echo "[${label}] ✔ STAGING done ${item.name ?: jobName}"
+          } catch (e) { ok=false; err=e.getMessage(); echo "[${label}] ✖ STAGING fail ${item.name ?: jobName}: ${err}" }
+          finalizeOnMaster(item, jobName, ok, err, label)
         }
       }
     }
+    parallel branches
   }
 }
+
+/* ----------------------- Claim / finalize / queue helpers ----------------------- */
 
 def claimOnMaster(int liveMax, int stagingMax) {
   lock(resource: 'queue-json') {
@@ -331,7 +273,6 @@ def claimOnMaster(int liveMax, int stagingMax) {
     }
 
     writeFile file: env.QUEUE_PATH, text: pretty(cur)
-
     writeFile file: 'live_claims.json',    text: pretty(liveClaims)
     writeFile file: 'staging_claims.json', text: pretty(stagingClaims)
 
@@ -344,7 +285,7 @@ def claimOnMaster(int liveMax, int stagingMax) {
   }
 }
 
-def finalizeOnMaster(Map item, String jobName, boolean ok, String err) {
+def finalizeOnMaster(Map item, String jobName, boolean ok, String err, String label='master') {
   node('master') {
     lock(resource: 'queue-json') {
       unstash 'queue-snapshot'
@@ -367,8 +308,7 @@ def finalizeOnMaster(Map item, String jobName, boolean ok, String err) {
           int attempts = ((j.attempts ?: 0) as int) + 1
           j.attempts = attempts
           if (attempts >= 3) {
-            j.status = 'failed'
-            j.error  = err ?: 'unknown'
+            j.status='failed'; j.error = err ?: 'unknown'
             (cur.deadLetter as List) << j
             cur.jobs.remove(idx)
           } else {
@@ -379,7 +319,7 @@ def finalizeOnMaster(Map item, String jobName, boolean ok, String err) {
         writeFile file: env.QUEUE_PATH, text: pretty(cur)
         stash name: 'queue-snapshot', includes: 'queue.json'
       } else {
-        echo "[${env.AGENT_LABEL ?: 'master'}] WARN: Claimed item not found during finalize."
+        echo "[${label}] WARN: Claimed item not found during finalize."
       }
     }
   }
@@ -395,9 +335,7 @@ def readQueue() {
   }
 }
 
-/* ---------- tiny utilities ---------- */
-
-def whenTrue(boolean expr, Closure body) { if (expr) body() }
+/* ----------------------- Utils ----------------------- */
 
 @NonCPS
 def parseJobsToPlain(String raw) {
@@ -441,7 +379,7 @@ def sortJobs(List jobs) {
     if (cmp != 0) return cmp
     String ra = (a?.receivedAt ?: '')
     String rb = (b?.receivedAt ?: '')
-    return (ra <=> rb) // FIFO
+    return (ra <=> rb) // FIFO among equals
   }
   return copy
 }
