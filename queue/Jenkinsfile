@@ -6,8 +6,8 @@ pipeline {
     booleanParam(name: 'PURGE_QUEUE', defaultValue: false, description: 'Wipe queue.json (fresh start).')
     booleanParam(name: 'PURGE_DEADLETTER', defaultValue: false, description: 'Clear deadLetter only.')
     booleanParam(name: 'REQUEUE_DEADLETTER', defaultValue: false, description: 'Requeue DLQ items with attempts=0.')
-    string(name: 'MAX_LIVE', defaultValue: '4', description: 'Max live jobs per cycle (≤ live tokens).')
-    string(name: 'MAX_STAGING', defaultValue: '4', description: 'Max staging jobs per cycle (≤ staging tokens).')
+    string(name: 'MAX_LIVE', defaultValue: '4', description: 'Max live jobs per cycle (≤ LIVE_TOKENS size).')
+    string(name: 'MAX_STAGING', defaultValue: '4', description: 'Max staging jobs per cycle (≤ STG_TOKENS size).')
     string(name: 'RETRY_LIMIT', defaultValue: '3', description: 'Max attempts before moving to deadLetter.')
     string(name: 'IDLE_SLEEP', defaultValue: '15', description: 'Seconds to sleep when nothing to claim.')
   }
@@ -15,14 +15,12 @@ pipeline {
   options {
     timestamps()
     buildDiscarder(logRotator(numToKeepStr: '30', daysToKeepStr: '30'))
-    // Keep this commented if you want "ingest while running" from other upstream builds.
+    // Keep concurrent builds ON so new upstream runs can ingest while draining.
     // disableConcurrentBuilds()
   }
 
   environment {
     QUEUE_PATH = 'queue.json'
-    LIVE_LABEL = 'api-token-live'
-    STG_LABEL  = 'api-token-staging'
   }
 
   stages {
@@ -79,7 +77,7 @@ pipeline {
             (incoming.jobs ?: []).each { j ->
               def item = toPlain(j) ?: [:]
               if (!(item.parameters instanceof List)) item.parameters = []
-              // normalize env from parameters; default staging if missing
+              // normalize env; default staging
               def envParam = item.parameters.find { it?.name?.toString() == 'env' }
               def envValue = envParam?.value?.toString()?.toLowerCase()
               if (!envValue) {
@@ -90,6 +88,7 @@ pipeline {
               item.status    = 'queued'
               item.attempts  = (item.attempts ?: 0) as int
               item.receivedAt = item.receivedAt ?: nowIso
+
               if (!item.job) {
                 item.error = 'missing job name (ingest)'
                 (cur.deadLetter as List) << item
@@ -106,19 +105,29 @@ pipeline {
       }
     }
 
-    stage('Drain queue (live & staging token pools)') {
+    stage('Drain queue (explicit token lists)') {
       steps {
         script {
+          // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+          // EDIT HERE when tokens change:
+          List LIVE_TOKENS = ['lockA','lockB']          // add more later
+          List STG_TOKENS  = ['lockC','lockD']          // add more later
+          // <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
           int maxLive    = safeInt(params.MAX_LIVE, 4)
           int maxStaging = safeInt(params.MAX_STAGING, 4)
           int retryLimit = safeInt(params.RETRY_LIMIT, 3)
           int idleSleep  = safeInt(params.IDLE_SLEEP, 15)
 
+          // Effective concurrency cannot exceed token counts:
+          int effLive    = Math.max(0, Math.min(maxLive, LIVE_TOKENS.size()))
+          int effStaging = Math.max(0, Math.min(maxStaging, STG_TOKENS.size()))
+
           while (true) {
             List liveClaims = []
             List stgClaims  = []
 
-            // 1) CLAIM on master, separate by env
+            // 1) CLAIM on master, mark running
             lock(resource: 'queue-json') {
               def cur = ensureQueueFile()
               cur.jobs = sortJobs(cur.jobs as List)
@@ -126,8 +135,8 @@ pipeline {
               def queuedLive = (cur.jobs as List).findAll { (it.status ?: 'queued') == 'queued' && (it.env ?: 'staging') == 'live' }
               def queuedStg  = (cur.jobs as List).findAll { (it.status ?: 'queued') == 'queued' && (it.env ?: 'staging') == 'staging' }
 
-              liveClaims = queuedLive.take(maxLive).collect { toPlain(it) }
-              stgClaims  = queuedStg.take(maxStaging).collect { toPlain(it) }
+              liveClaims = queuedLive.take(effLive).collect { toPlain(it) }
+              stgClaims  = queuedStg.take(effStaging).collect { toPlain(it) }
 
               if (!liveClaims && !stgClaims) {
                 writeQueue(cur)
@@ -176,7 +185,7 @@ pipeline {
               }
             } // lock queue-json
 
-            // If nothing to claim, brief idle; exit if truly drained
+            // If nothing to claim, short idle; exit if drained
             if (!liveClaims && !stgClaims) {
               echo "Nothing to claim; sleeping ${idleSleep}s..."
               sleep(time: idleSleep, unit: 'SECONDS')
@@ -196,29 +205,31 @@ pipeline {
 
             echo "Claimed live=${liveClaims.size()}, staging=${stgClaims.size()} this cycle."
 
-            // 2) RUN both pools in parallel; each branch locks from the correct label
+            // 2) RUN: map each claim to a unique token from the list
             def branches = [:]
 
             for (int i = 0; i < liveClaims.size(); i++) {
-              def item = liveClaims[i]
+              def item  = liveClaims[i]
+              def token = LIVE_TOKENS[i]   // unique per cycle
               branches["live-${i}-${item.name ?: item.job}"] = {
-                lock(label: env.LIVE_LABEL, quantity: 1) {
+                lock(resource: token) {
                   runAndFinalize(item, retryLimit)
                 }
               }
             }
 
             for (int i = 0; i < stgClaims.size(); i++) {
-              def item = stgClaims[i]
+              def item  = stgClaims[i]
+              def token = STG_TOKENS[i]    // unique per cycle
               branches["stg-${i}-${item.name ?: item.job}"] = {
-                lock(label: env.STG_LABEL, quantity: 1) {
+                lock(resource: token) {
                   runAndFinalize(item, retryLimit)
                 }
               }
             }
 
             parallel branches
-            // loop continues to next batch
+            // loop for next batch (and to pick up newly ingested items)
           } // while
         } // script
       } // steps
