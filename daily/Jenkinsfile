@@ -9,9 +9,9 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
     timestamps()
   }
-  triggers {
+  /*triggers {
     cron('* * * * *')
-  }
+  }*/
   environment {
     BUILD_BY = "${currentBuild.getBuildCauses()}"
   }
