@@ -10,10 +10,7 @@ pipeline {
     timestamps()
   }
   triggers {
-    '''
-    TZ = America/Chicago
-      H/1 * * * *
-    '''
+    cron('* * * * *')
   }
   environment {
     BUILD_BY = "${currentBuild.getBuildCauses()}"
