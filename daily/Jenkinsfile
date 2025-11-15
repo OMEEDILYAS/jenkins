@@ -9,7 +9,12 @@ pipeline {
     buildDiscarder(logRotator(numToKeepStr: '15', daysToKeepStr: '30'))
     timestamps()
   }
-  // triggers implement later
+  triggers {
+    '''
+    TZ = America/Chicago
+      H/1 * * * *
+    '''
+  }
   environment {
     BUILD_BY = "${currentBuild.getBuildCauses()}"
   }
