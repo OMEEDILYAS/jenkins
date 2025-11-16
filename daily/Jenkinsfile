@@ -13,12 +13,12 @@ pipeline {
     cron('* * * * *')
   }*/
   environment {
-    BUILD_BY = "${currentBuild.getBuildCauses()}"
+    BUILD_BY = "${currentBuild.getBuildCauses()[0].uerID}"
   }
   stages {
     stage('send all jobs to queue') {
       when {
-        expression { BUILD_BY == 'null' }
+        expression { BUILD_BY != 'null' }
       }
       steps {
         script {
@@ -37,7 +37,7 @@ pipeline {
     }
     stage('triggered by user') {
       when {
-        expression { BUILD_BY != 'null' }
+        expression { BUILD_BY == 'null' }
       }
       steps {
         script {
